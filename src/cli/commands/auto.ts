@@ -1770,9 +1770,10 @@ export async function runAuto(
       // Phase 1: remember what this row would cost if it is ever SHOWN. Both keys travel, because the
       // dedup gate checks `preCheckFiredKey` (first qualifying flag) while the row carries `firedKey`
       // (the flag Stage 2 selected) — charging only the second would leave the first uncharged for
-      // ever, and an uncharged key never blocks.
+      // ever, and an uncharged key never blocks. Bound to THIS row's prompt index: a row that is
+      // replaced or dropped unseen must not leave its keys behind for the next popup to spend.
       if (freqConfig.countBudgetOnShow) {
-        mgr.markPendingPopupChargeKeysV1(store, [preCheckFiredKey, firedKey]);
+        mgr.markPendingPopupChargeV1(store, mgr.current.promptCount, [preCheckFiredKey, firedKey]);
       }
     }
   }

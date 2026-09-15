@@ -617,7 +617,7 @@ export async function runStop(
         // Phase 1: the user received it, so this is where the session budget is spent. A popup that is
         // prepared and never displayed costs nothing. No-op unless the frequency level reads the
         // shown-popup state (`countBudgetOnShow`).
-        mgr.chargeShownPopupV1(store, pendingPe.request.reviewMomentContext.triggerProvenance.firedKey);
+        mgr.chargeShownPopupV1(store, pendingPe.promptCount, pendingPe.request.reviewMomentContext.triggerProvenance.firedKey);
         // D1 (P9-G1 / resolves P9-G2): record source-use + generated-origin BEFORE transport via
         // the typed Stop-bridge delivery contract — the audit/lineage tables the ad-hoc path never
         // wrote live. Best-effort: an audit-write failure must never lose the injection (4d).
@@ -650,7 +650,7 @@ export async function runStop(
         mgr.markPromptEnhancementPopupShown(store);
         // Phase 1: displayed counts as received — dismiss and use-original included, since the user
         // saw the guidance either way. Same charge as the inject path above.
-        mgr.chargeShownPopupV1(store, pendingPe.request.reviewMomentContext.triggerProvenance.firedKey);
+        mgr.chargeShownPopupV1(store, pendingPe.promptCount, pendingPe.request.reviewMomentContext.triggerProvenance.firedKey);
         logger.info('stop_prompt_enhancement_shown', { cwd: payload.cwd });
         // Phase 5: the user's "something else" popup resolved WITHOUT blocking (use-original / dismiss),
         // so their own turn is done — a sequence held from an earlier interruption resumes now.

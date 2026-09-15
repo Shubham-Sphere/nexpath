@@ -131,12 +131,18 @@ export interface SessionState {
    */
   shownPopupCount?: number;
   /**
-   * Keys to charge if the pending PE row is shown. Written when the row is stored, consumed at the
-   * moment the popup is displayed. It carries BOTH the dedup pre-check key (built from the first
-   * qualifying flag) and the fired key (built from the classifier's selected flag), because those two
-   * can differ and the row itself only carries the second one. Optional; cleared after each charge.
+   * What to charge if the pending PE row is shown — BOUND to the row it was written for.
+   *
+   * It carries BOTH the dedup pre-check key (built from the first qualifying flag) and the fired key
+   * (built from the classifier's selected flag), because those two can differ and the row itself only
+   * carries the second one. `promptCount` is the row's own prompt index, and the charge uses these
+   * keys only when it matches the row being shown: a pending row is replaced (there is exactly one per
+   * project) or consumed unseen by paths that know nothing about this state — the sequence-shaped
+   * fallback, the Stop cooldown branch, the submit-time sweep — and without the binding those keys
+   * would be spent by the NEXT popup, marking advice "seen" that was never displayed. Optional;
+   * cleared after each charge.
    */
-  pendingPopupChargeKeys?: string[];
+  pendingPopupCharge?: { promptCount: number; keys: string[] };
   /**
    * Number of consecutive prompts processed without a correction_seeking signal being detected.
    * Resets to 0 whenever correction_seeking is detected in a prompt; increments on every other prompt.

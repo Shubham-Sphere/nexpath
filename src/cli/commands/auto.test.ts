@@ -3844,13 +3844,13 @@ describe('SessionStateManager — shown-popup budget (Phase 1)', () => {
     const mgr = SessionStateManager.load(store, '/proj/shown-init');
     expect(mgr.current.shownPopupCount).toBe(0);
     expect(mgr.current.shownAdvisoryKeys).toEqual([]);
-    expect(mgr.current.pendingPopupChargeKeys).toEqual([]);
+    expect(mgr.current.pendingPopupCharge).toBeUndefined();
     expect(mgr.hasShownAdvisoryKeyV1('absence:test_creation@implementation')).toBe(false);
   });
 
   it('chargeShownPopupV1 counts the popup, records its key, and persists both', () => {
     const mgr = SessionStateManager.load(store, '/proj/shown-charge');
-    mgr.chargeShownPopupV1(store, 'absence:test_creation@implementation');
+    mgr.chargeShownPopupV1(store, 12, 'absence:test_creation@implementation');
     expect(mgr.current.shownPopupCount).toBe(1);
     expect(mgr.hasShownAdvisoryKeyV1('absence:test_creation@implementation')).toBe(true);
     // Survives a reload — the gates read it on the NEXT prompt, from a fresh load.
@@ -3864,21 +3864,49 @@ describe('SessionStateManager — shown-popup budget (Phase 1)', () => {
     // the flag Stage 2 selected. They differ whenever those are not the same flag, and charging only
     // the row's key would leave the checked one permanently uncharged — so it would never block.
     const mgr = SessionStateManager.load(store, '/proj/shown-both-keys');
-    mgr.markPendingPopupChargeKeysV1(store, ['absence:test_creation@implementation', 'absence:regression_check@implementation']);
-    mgr.chargeShownPopupV1(store, 'absence:regression_check@implementation');
+    mgr.markPendingPopupChargeV1(store, 12, ['absence:test_creation@implementation', 'absence:regression_check@implementation']);
+    mgr.chargeShownPopupV1(store, 12, 'absence:regression_check@implementation');
     expect(mgr.hasShownAdvisoryKeyV1('absence:test_creation@implementation')).toBe(true);
     expect(mgr.hasShownAdvisoryKeyV1('absence:regression_check@implementation')).toBe(true);
     expect(mgr.current.shownAdvisoryKeys).toHaveLength(2);   // no duplicate for the repeated key
     expect(mgr.current.shownPopupCount).toBe(1);             // one popup, two keys
-    expect(mgr.current.pendingPopupChargeKeys).toEqual([]);  // consumed
+    expect(mgr.current.pendingPopupCharge).toBeUndefined();  // consumed
+  });
+
+  it('does NOT spend one row\'s keys on a different row\'s popup', () => {
+    // ⛔ The failure this binding exists to stop, and it is the phase's own bug in miniature. There is
+    // exactly one pending PE row per project, and three paths replace or drop it without knowing about
+    // this state: the sequence-shaped fallback stores a row of its own, the Stop cooldown branch
+    // consumes one unseen, and the submit-time sweep clears one after a handled turn. Unbound, the
+    // keys left behind by the dropped row were spent by the NEXT popup — marking advice "seen" that
+    // was never displayed, which is exactly what silences a signal for the rest of the session.
+    const mgr = SessionStateManager.load(store, '/proj/shown-rebound');
+    mgr.markPendingPopupChargeV1(store, 12, ['absence:test_creation@implementation']);
+    // The row from prompt 12 was never shown; the popup that reaches the user is the row stored at 14.
+    mgr.chargeShownPopupV1(store, 14, 'absence:regression_check@implementation');
+    expect(mgr.hasShownAdvisoryKeyV1('absence:test_creation@implementation')).toBe(false);
+    expect(mgr.hasShownAdvisoryKeyV1('absence:regression_check@implementation')).toBe(true);
+    expect(mgr.current.shownPopupCount).toBe(1);
+    // The orphaned entry is dropped with the charge — the row it belonged to no longer exists.
+    expect(mgr.current.pendingPopupCharge).toBeUndefined();
+  });
+
+  it('a row that waits for a later Stop still spends its own keys', () => {
+    // The other half of the binding: a prepared row whose host could not show it stays pending across
+    // prompts, and when a later Stop finally shows it, the keys written with it are still ITS keys.
+    const mgr = SessionStateManager.load(store, '/proj/shown-deferred');
+    mgr.markPendingPopupChargeV1(store, 12, ['absence:test_creation@implementation', 'stage_transition:idea→implementation']);
+    mgr.chargeShownPopupV1(store, 12, 'stage_transition:idea→implementation');
+    expect(mgr.hasShownAdvisoryKeyV1('absence:test_creation@implementation')).toBe(true);
+    expect(mgr.hasShownAdvisoryKeyV1('stage_transition:idea→implementation')).toBe(true);
   });
 
   it('never records a synthetic sequence_shaped:* key', () => {
     // These name a prompt position, not an advisory event: they would block nothing and only grow
     // the list, which the dedup gate scans on every prompt.
     const mgr = SessionStateManager.load(store, '/proj/shown-synthetic');
-    mgr.markPendingPopupChargeKeysV1(store, ['sequence_shaped:7']);
-    mgr.chargeShownPopupV1(store, 'sequence_shaped:7');
+    mgr.markPendingPopupChargeV1(store, 7, ['sequence_shaped:7']);
+    mgr.chargeShownPopupV1(store, 7, 'sequence_shaped:7');
     expect(mgr.current.shownAdvisoryKeys).toEqual([]);
     expect(mgr.current.shownPopupCount).toBe(1);  // the popup still spends a cap slot
   });
@@ -3888,12 +3916,12 @@ describe('SessionStateManager — shown-popup budget (Phase 1)', () => {
     // dedup key (it is not an advisory event) and must not spend the pending PE row's keys — that
     // row has NOT been shown.
     const mgr = SessionStateManager.load(store, '/proj/shown-mps2');
-    mgr.markPendingPopupChargeKeysV1(store, ['absence:test_creation@implementation']);
+    mgr.markPendingPopupChargeV1(store, 12, ['absence:test_creation@implementation']);
     const cooldownBefore = mgr.current.lastPromptEnhancementPromptIndex;
     mgr.chargeShownContinuationPopupV1(store);
     expect(mgr.current.shownPopupCount).toBe(1);
     expect(mgr.current.shownAdvisoryKeys).toEqual([]);
-    expect(mgr.current.pendingPopupChargeKeys).toEqual(['absence:test_creation@implementation']);
+    expect(mgr.current.pendingPopupCharge).toEqual({ promptCount: 12, keys: ['absence:test_creation@implementation'] });
     // …and it does not reset the PE popup cooldown — a sequence's own steps must not throttle each other.
     expect(mgr.current.lastPromptEnhancementPromptIndex).toBe(cooldownBefore);
   });
@@ -3903,10 +3931,10 @@ describe('SessionStateManager — shown-popup budget (Phase 1)', () => {
     const legacy = mgr as unknown as { state: Record<string, unknown> };
     delete legacy.state.shownAdvisoryKeys;
     delete legacy.state.shownPopupCount;
-    delete legacy.state.pendingPopupChargeKeys;
+    delete legacy.state.pendingPopupCharge;
     expect(mgr.hasShownAdvisoryKeyV1('absence:test_creation@implementation')).toBe(false);
     expect(mgr.current.shownPopupCount ?? 0).toBe(0);
-    mgr.chargeShownPopupV1(store, 'absence:test_creation@implementation');
+    mgr.chargeShownPopupV1(store, 3, 'absence:test_creation@implementation');
     expect(mgr.current.shownPopupCount).toBe(1);
     expect(mgr.hasShownAdvisoryKeyV1('absence:test_creation@implementation')).toBe(true);
   });
@@ -3914,13 +3942,13 @@ describe('SessionStateManager — shown-popup budget (Phase 1)', () => {
   it('the 30-minute session gap empties the new fields with the old ones', async () => {
     const { SESSION_GAP_MS } = await import('../../classifier/SessionStateManager.js');
     const mgr1 = SessionStateManager.load(store, '/proj/shown-gap');
-    mgr1.markPendingPopupChargeKeysV1(store, ['absence:test_creation@implementation']);
-    mgr1.chargeShownPopupV1(store, 'absence:test_creation@implementation');
+    mgr1.markPendingPopupChargeV1(store, 12, ['absence:test_creation@implementation']);
+    mgr1.chargeShownPopupV1(store, 12, 'absence:test_creation@implementation');
 
     const mgr2 = SessionStateManager.load(store, '/proj/shown-gap', Date.now() + SESSION_GAP_MS + 1000);
     expect(mgr2.current.shownPopupCount).toBe(0);
     expect(mgr2.current.shownAdvisoryKeys).toEqual([]);
-    expect(mgr2.current.pendingPopupChargeKeys).toEqual([]);
+    expect(mgr2.current.pendingPopupCharge).toBeUndefined();
     expect(mgr2.hasShownAdvisoryKeyV1('absence:test_creation@implementation')).toBe(false);
   });
 });
@@ -3992,7 +4020,7 @@ describe('runAuto — budget counted on show (optimum level)', () => {
 
   it('an advisory whose popup WAS shown blocks the same key', async () => {
     const debugSpy = await runToDedupGate('/test/show-dedup-seen', (mgr) => {
-      for (const key of everyFiredKey('test_creation')) mgr.chargeShownPopupV1(store, key);
+      for (const key of everyFiredKey('test_creation')) mgr.chargeShownPopupV1(store, mgr.current.promptCount, key);
     });
     expect(dedupDecision(debugSpy)).toBe(true);
     expect(writeTelemetry).toHaveBeenCalledWith(
@@ -4073,6 +4101,36 @@ describe('runAuto — PE prepare is skipped while the popup cooldown is active (
       // Layer A (the advisory) is deliberately untouched — only the PE prepare is skipped.
       expect(result).toEqual({ outcome: 'pending' });
       expect(getPendingAdvisory(store, projectRoot)).not.toBeNull();
+    } finally {
+      store.db.close();
+    }
+  });
+
+  it('binds the charge keys to the row it stored — a mismatch would make them unspendable', async () => {
+    // The write side of the binding. `chargeShownPopupV1` spends the remembered keys only for the row
+    // whose prompt index they carry, so if this write ever names a different index the pre-check key
+    // is silently never charged — and a key that is never charged never blocks, which is the old bug
+    // wearing new clothes. Pinned against the row itself rather than against a literal.
+    const store = await openStore(':memory:');
+    try {
+      const projectRoot = '/test/pe-charge-binding';
+      setConfig(store, 'advisory_frequency', 'optimum');
+      primeTaskBreakdownSession(store, projectRoot);
+      const request = makeBoundaryRequest(store, projectRoot);
+      const facadeResult = await preparePromptEnhancement(request);
+
+      await runAuto(
+        makeInput({ projectRoot }),
+        store,
+        makeMockOpenAI(FIRE_YES_RESPONSE, 'Hold up.'),
+        { request, prepare: vi.fn().mockResolvedValue(asLlmWorded(facadeResult)) },
+      );
+
+      const row = getPendingPromptEnhancement(store, projectRoot);
+      expect(row).not.toBeNull();
+      const pending = SessionStateManager.load(store, projectRoot).current.pendingPopupCharge;
+      expect(pending?.promptCount).toBe(row!.promptCount);
+      expect(pending?.keys.length).toBeGreaterThan(0);
     } finally {
       store.db.close();
     }

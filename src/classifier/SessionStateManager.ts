@@ -87,7 +87,7 @@ function newSession(projectRoot: string, now: number): SessionState {
     advisoryCount:                0,
     shownAdvisoryKeys:            [],
     shownPopupCount:              0,
-    pendingPopupChargeKeys:       [],
+    pendingPopupCharge:           undefined,
     consecutiveAcceptanceStreak:  0,
     consecutiveFrustratedPrompts: 0,
     currentAgentMode:             undefined,
@@ -409,16 +409,22 @@ export class SessionStateManager {
   }
 
   /**
-   * Remember which advisory keys to charge if the PE row just stored is ever SHOWN.
+   * Remember what to charge if the PE row just stored is ever SHOWN, bound to that row.
    *
    * Both keys are carried: the dedup pre-check key (built from the first qualifying flag, before
    * Stage 2 selects one) and the fired key (built from the flag the classifier selected). They differ
    * whenever the classifier picks a different qualifying flag, and the stored row only carries the
    * second one — so charging only the row's key would leave the checked key permanently uncharged,
-   * and it would never block. One pending set at a time, matching the one pending row per project.
+   * and it would never block.
+   *
+   * `rowPromptCount` is the stored row's own prompt index; the charge below spends these keys only for
+   * that row. One pending entry at a time, matching the one pending row per project.
    */
-  markPendingPopupChargeKeysV1(store: Store, keys: readonly string[]): void {
-    this.state.pendingPopupChargeKeys = [...new Set(keys.filter((k) => k.length > 0))];
+  markPendingPopupChargeV1(store: Store, rowPromptCount: number, keys: readonly string[]): void {
+    this.state.pendingPopupCharge = {
+      promptCount: rowPromptCount,
+      keys: [...new Set(keys.filter((k) => k.length > 0))],
+    };
     saveState(store, this.state);
   }
 
@@ -430,16 +436,28 @@ export class SessionStateManager {
    * `sequence_shaped:*` keys are never recorded: they name a prompt position, not an advisory, so they
    * would block nothing and only grow the list. A popup that is prepared and never displayed costs
    * nothing, which is the whole point of the phase.
+   *
+   * The remembered keys are spent ONLY when they were written for the row being shown
+   * (`rowPromptCount`). A pending row can be replaced or dropped by paths that know nothing about this
+   * state — the sequence-shaped fallback stores a row of its own, the Stop cooldown branch and the
+   * submit-time sweep consume one unseen — and spending another row's keys would mark advice "seen"
+   * that was never displayed, which is the very failure this phase exists to remove. The entry is
+   * cleared either way: a charge ends the shown row's life, and a non-matching entry belongs to a row
+   * that no longer exists.
    */
-  chargeShownPopupV1(store: Store, firedKey?: string): void {
+  chargeShownPopupV1(store: Store, rowPromptCount: number, firedKey?: string): void {
     this.state.shownPopupCount = (this.state.shownPopupCount ?? 0) + 1;
     if (!this.state.shownAdvisoryKeys) this.state.shownAdvisoryKeys = [];
-    const keys = [...(this.state.pendingPopupChargeKeys ?? []), ...(firedKey ? [firedKey] : [])];
+    const pending = this.state.pendingPopupCharge;
+    const keys = [
+      ...(pending?.promptCount === rowPromptCount ? pending.keys : []),
+      ...(firedKey ? [firedKey] : []),
+    ];
     for (const key of keys) {
       if (key.startsWith('sequence_shaped:')) continue;
       if (!this.state.shownAdvisoryKeys.includes(key)) this.state.shownAdvisoryKeys.push(key);
     }
-    this.state.pendingPopupChargeKeys = [];
+    this.state.pendingPopupCharge = undefined;
     saveState(store, this.state);
   }
 
@@ -447,8 +465,8 @@ export class SessionStateManager {
    * Charge the popup budget for a SHOWN MPS-2 continuation item: count only.
    *
    * No dedup key (a continuation step is not an advisory event) and no cooldown reset (a sequence's
-   * own steps must not throttle each other). It also leaves `pendingPopupChargeKeys` untouched: those
-   * belong to a PE row that has NOT been shown, and a continuation must never spend them.
+   * own steps must not throttle each other). It also leaves `pendingPopupCharge` untouched: that entry
+   * belongs to a PE row that has NOT been shown, and a continuation must never spend it.
    */
   chargeShownContinuationPopupV1(store: Store): void {
     this.state.shownPopupCount = (this.state.shownPopupCount ?? 0) + 1;
