@@ -54,6 +54,8 @@ import { setConfig } from '../../store/config.js';
 import { readCadence, IDLE_CAP_MS } from '../../store/feedback-cadence.js';
 import type OpenAI from 'openai';
 import { SessionStateManager } from '../../classifier/SessionStateManager.js';
+import { STAGES } from '../../core/classifier/types.js';
+import { logger } from '../../logger.js';
 import { buildSafeDefaults } from '../../classifier/LLMProfileClassifier.js';
 import { applyPromptEnhancementAction, preparePromptEnhancement } from '../../prompt-enhancement/facade.js';
 import { validatePromptEnhancementPrepareRequestV1 } from '../../prompt-enhancement/contracts.js';
@@ -3822,5 +3824,283 @@ describe('F4 — dismissed_or_user_skipped, the value that had no producer', () 
 
   it('an undismissed signal on the same path stays fresh_trigger_eligible', async () => {
     expect(await eligibilityForDismissalState(false)).toBe('fresh_trigger_eligible');
+  });
+});
+
+// ── Phase 1 — the session budget is charged when a popup is SHOWN ─────────────
+//
+// Under `countBudgetOnShow` the two per-session budgets stop counting advisories that FIRED and start
+// counting popups the user actually SAW: dedup reads `shownAdvisoryKeys`, the cap reads
+// `shownPopupCount`. `firedDecisionSessions` / `advisoryCount` keep being written at fire time, so
+// `once_per_session` and the telemetry counters are unchanged.
+
+describe('SessionStateManager — shown-popup budget (Phase 1)', () => {
+  let store: Store;
+
+  beforeEach(async () => { store = await openStore(':memory:'); });
+  afterEach(() => { store.db.close(); });
+
+  it('a fresh session starts with no shown popups and no shown keys', () => {
+    const mgr = SessionStateManager.load(store, '/proj/shown-init');
+    expect(mgr.current.shownPopupCount).toBe(0);
+    expect(mgr.current.shownAdvisoryKeys).toEqual([]);
+    expect(mgr.current.pendingPopupChargeKeys).toEqual([]);
+    expect(mgr.hasShownAdvisoryKeyV1('absence:test_creation@implementation')).toBe(false);
+  });
+
+  it('chargeShownPopupV1 counts the popup, records its key, and persists both', () => {
+    const mgr = SessionStateManager.load(store, '/proj/shown-charge');
+    mgr.chargeShownPopupV1(store, 'absence:test_creation@implementation');
+    expect(mgr.current.shownPopupCount).toBe(1);
+    expect(mgr.hasShownAdvisoryKeyV1('absence:test_creation@implementation')).toBe(true);
+    // Survives a reload — the gates read it on the NEXT prompt, from a fresh load.
+    const reloaded = SessionStateManager.load(store, '/proj/shown-charge');
+    expect(reloaded.current.shownPopupCount).toBe(1);
+    expect(reloaded.hasShownAdvisoryKeyV1('absence:test_creation@implementation')).toBe(true);
+  });
+
+  it('charges BOTH the pre-check key and the row key, then clears the pending set', () => {
+    // The dedup gate checks the key of the FIRST qualifying flag; the stored row carries the key of
+    // the flag Stage 2 selected. They differ whenever those are not the same flag, and charging only
+    // the row's key would leave the checked one permanently uncharged — so it would never block.
+    const mgr = SessionStateManager.load(store, '/proj/shown-both-keys');
+    mgr.markPendingPopupChargeKeysV1(store, ['absence:test_creation@implementation', 'absence:regression_check@implementation']);
+    mgr.chargeShownPopupV1(store, 'absence:regression_check@implementation');
+    expect(mgr.hasShownAdvisoryKeyV1('absence:test_creation@implementation')).toBe(true);
+    expect(mgr.hasShownAdvisoryKeyV1('absence:regression_check@implementation')).toBe(true);
+    expect(mgr.current.shownAdvisoryKeys).toHaveLength(2);   // no duplicate for the repeated key
+    expect(mgr.current.shownPopupCount).toBe(1);             // one popup, two keys
+    expect(mgr.current.pendingPopupChargeKeys).toEqual([]);  // consumed
+  });
+
+  it('never records a synthetic sequence_shaped:* key', () => {
+    // These name a prompt position, not an advisory event: they would block nothing and only grow
+    // the list, which the dedup gate scans on every prompt.
+    const mgr = SessionStateManager.load(store, '/proj/shown-synthetic');
+    mgr.markPendingPopupChargeKeysV1(store, ['sequence_shaped:7']);
+    mgr.chargeShownPopupV1(store, 'sequence_shaped:7');
+    expect(mgr.current.shownAdvisoryKeys).toEqual([]);
+    expect(mgr.current.shownPopupCount).toBe(1);  // the popup still spends a cap slot
+  });
+
+  it('an MPS-2 continuation charge counts, adds no key, and leaves the pending set intact', () => {
+    // Owner decision 2026-09-14: a continuation item the user sees spends a cap slot. It adds no
+    // dedup key (it is not an advisory event) and must not spend the pending PE row's keys — that
+    // row has NOT been shown.
+    const mgr = SessionStateManager.load(store, '/proj/shown-mps2');
+    mgr.markPendingPopupChargeKeysV1(store, ['absence:test_creation@implementation']);
+    const cooldownBefore = mgr.current.lastPromptEnhancementPromptIndex;
+    mgr.chargeShownContinuationPopupV1(store);
+    expect(mgr.current.shownPopupCount).toBe(1);
+    expect(mgr.current.shownAdvisoryKeys).toEqual([]);
+    expect(mgr.current.pendingPopupChargeKeys).toEqual(['absence:test_creation@implementation']);
+    // …and it does not reset the PE popup cooldown — a sequence's own steps must not throttle each other.
+    expect(mgr.current.lastPromptEnhancementPromptIndex).toBe(cooldownBefore);
+  });
+
+  it('state saved before these fields existed reads as empty and still charges', () => {
+    const mgr = SessionStateManager.load(store, '/proj/shown-legacy');
+    const legacy = mgr as unknown as { state: Record<string, unknown> };
+    delete legacy.state.shownAdvisoryKeys;
+    delete legacy.state.shownPopupCount;
+    delete legacy.state.pendingPopupChargeKeys;
+    expect(mgr.hasShownAdvisoryKeyV1('absence:test_creation@implementation')).toBe(false);
+    expect(mgr.current.shownPopupCount ?? 0).toBe(0);
+    mgr.chargeShownPopupV1(store, 'absence:test_creation@implementation');
+    expect(mgr.current.shownPopupCount).toBe(1);
+    expect(mgr.hasShownAdvisoryKeyV1('absence:test_creation@implementation')).toBe(true);
+  });
+
+  it('the 30-minute session gap empties the new fields with the old ones', async () => {
+    const { SESSION_GAP_MS } = await import('../../classifier/SessionStateManager.js');
+    const mgr1 = SessionStateManager.load(store, '/proj/shown-gap');
+    mgr1.markPendingPopupChargeKeysV1(store, ['absence:test_creation@implementation']);
+    mgr1.chargeShownPopupV1(store, 'absence:test_creation@implementation');
+
+    const mgr2 = SessionStateManager.load(store, '/proj/shown-gap', Date.now() + SESSION_GAP_MS + 1000);
+    expect(mgr2.current.shownPopupCount).toBe(0);
+    expect(mgr2.current.shownAdvisoryKeys).toEqual([]);
+    expect(mgr2.current.pendingPopupChargeKeys).toEqual([]);
+    expect(mgr2.hasShownAdvisoryKeyV1('absence:test_creation@implementation')).toBe(false);
+  });
+});
+
+describe('runAuto — budget counted on show (optimum level)', () => {
+  let store: Store;
+
+  beforeEach(async () => { store = await openStore(':memory:'); });
+  afterEach(() => { store.db.close(); vi.restoreAllMocks(); });
+
+  /**
+   * Every key the gate could build for this fixture — both trigger kinds, every stage — so the test
+   * states "this key was already spent" without depending on which trigger the run happens to produce.
+   * `dedupDecision` below proves the gate was actually reached, so the set is not a way to pass vacuously.
+   */
+  const everyFiredKey = (signalKey: string): string[] => [
+    ...STAGES.map((stage) => `absence:${signalKey}@${stage}`),
+    ...STAGES.flatMap((from) => STAGES.map((to) => `stage_transition:${from}→${to}`)),
+  ];
+
+  const dedupDecision = (debugSpy: { mock: { calls: unknown[][] } }): boolean | undefined =>
+    debugSpy.mock.calls
+      .filter((call) => call[0] === 'dedup')
+      .map((call) => (call[1] as { alreadyFired: boolean } | undefined)?.alreadyFired)
+      .at(-1);
+
+  /** Pin a non-vibe profile so the cap is the default 20 these tests name, not the vibe 30. */
+  const pinNonVibeProfile = (mgr: SessionStateManager): void => {
+    (mgr as unknown as { state: { profile: unknown } }).state.profile = {
+      nature: 'hardcore_pro', precisionScore: 8, playfulnessScore: 2,
+      mood: 'focused', depth: 'high', depthScore: 8, computedAt: mgr.current.promptCount,
+    };
+  };
+
+  /**
+   * Drive the pipeline to the dedup gate with an absence trigger: warm up past the min-prompts guard,
+   * then a low stage confidence plus an active flag makes shouldFireStage2 return that flag.
+   * Mirrors the session-cap fixtures above. Returns the logger spy, which carries the gate's decision.
+   */
+  async function runToDedupGate(
+    projectRoot: string,
+    seed: (mgr: SessionStateManager) => void,
+    level: 'optimum' | 'every_event' = 'optimum',
+  ) {
+    setConfig(store, 'advisory_frequency', level);
+    for (let i = 0; i < 3; i++) await runAuto(makeInput({ projectRoot }), store);
+    const mgr = SessionStateManager.load(store, projectRoot);
+    (mgr as unknown as { state: { stageConfidence: number } }).state.stageConfidence = 0.3;
+    seed(mgr);
+    mgr.addAbsenceFlag(store, {   // last — persists every hand-set field above with it
+      signalKey: 'test_creation', stage: 'implementation', raisedAtIndex: 0, cooldownUntil: 100,
+    });
+    const debugSpy = vi.spyOn(logger, 'debug');
+    await runAuto(makeInput({ projectRoot }), store, makeMockOpenAI(FIRE_YES_RESPONSE, 'Hold up.'));
+    return debugSpy;
+  }
+
+  it('an advisory that FIRED but was never shown does not block its own signal', async () => {
+    // The bug this phase fixes: the popup behind this key was discarded, so the user never saw the
+    // advice — and the key blocked every later detection of the same signal for the whole session.
+    const debugSpy = await runToDedupGate('/test/show-dedup-unseen', (mgr) => {
+      for (const key of everyFiredKey('test_creation')) mgr.markDecisionSessionFired(store, key);
+    });
+    expect(dedupDecision(debugSpy), 'the dedup gate was never reached — the assertion would prove nothing').toBe(false);
+    expect(writeTelemetry).not.toHaveBeenCalledWith(
+      expect.anything(), 'advisory_dedup_blocked', expect.anything(), expect.anything(),
+    );
+  });
+
+  it('an advisory whose popup WAS shown blocks the same key', async () => {
+    const debugSpy = await runToDedupGate('/test/show-dedup-seen', (mgr) => {
+      for (const key of everyFiredKey('test_creation')) mgr.chargeShownPopupV1(store, key);
+    });
+    expect(dedupDecision(debugSpy)).toBe(true);
+    expect(writeTelemetry).toHaveBeenCalledWith(
+      expect.anything(), 'advisory_dedup_blocked', expect.anything(), expect.anything(),
+    );
+  });
+
+  it('20 fired-but-unseen advisories do not reach the cap', async () => {
+    const { getSkippedSessions } = await import('../../store/skipped-sessions.js');
+    await runToDedupGate('/test/show-cap-unseen', (mgr) => {
+      pinNonVibeProfile(mgr);
+      (mgr as unknown as { state: { advisoryCount: number } }).state.advisoryCount = 25;
+    });
+    expect(getSkippedSessions(store, '/test/show-cap-unseen').some((s) => s.flagType === 'session_cap_reached')).toBe(false);
+  });
+
+  it('CONTROL — the same fixture with the switch OFF caps on the fired count, so the test above is not vacuous', async () => {
+    const { getSkippedSessions } = await import('../../store/skipped-sessions.js');
+    await runToDedupGate('/test/show-cap-control', (mgr) => {
+      pinNonVibeProfile(mgr);
+      (mgr as unknown as { state: { advisoryCount: number } }).state.advisoryCount = 25;
+    }, 'every_event');
+    expect(getSkippedSessions(store, '/test/show-cap-control').some((s) => s.flagType === 'session_cap_reached')).toBe(true);
+  });
+
+  it('20 popups the user SAW do reach the cap', async () => {
+    const { getSkippedSessions } = await import('../../store/skipped-sessions.js');
+    await runToDedupGate('/test/show-cap-seen', (mgr) => {
+      pinNonVibeProfile(mgr);
+      (mgr as unknown as { state: { shownPopupCount: number } }).state.shownPopupCount = 20;
+    });
+    expect(getSkippedSessions(store, '/test/show-cap-seen').some((s) => s.flagType === 'session_cap_reached')).toBe(true);
+  });
+
+  it('switch OFF (every_event, the default level): the fired key still blocks', async () => {
+    const projectRoot = '/test/show-switch-off';
+    for (let i = 0; i < 3; i++) await runAuto(makeInput({ projectRoot }), store);
+    const mgr = SessionStateManager.load(store, projectRoot);
+    (mgr as unknown as { state: { stageConfidence: number } }).state.stageConfidence = 0.3;
+    for (const key of everyFiredKey('test_creation')) mgr.markDecisionSessionFired(store, key);
+    mgr.addAbsenceFlag(store, {
+      signalKey: 'test_creation', stage: 'implementation', raisedAtIndex: 0, cooldownUntil: 100,
+    });
+    const debugSpy = vi.spyOn(logger, 'debug');
+    await runAuto(makeInput({ projectRoot }), store, makeMockOpenAI(FIRE_YES_RESPONSE, 'Hold up.'));
+    // No advisory_frequency set → every_event → countBudgetOnShow false → the fired key blocks, as always.
+    expect(dedupDecision(debugSpy)).toBe(true);
+  });
+});
+
+describe('runAuto — PE prepare is skipped while the popup cooldown is active (Phase 1)', () => {
+  it('prepares nothing and stores no row while a popup was just shown — the advisory is untouched', async () => {
+    const store = await openStore(':memory:');
+    try {
+      const projectRoot = '/test/pe-cooldown-skip';
+      setConfig(store, 'advisory_frequency', 'optimum');
+      primeTaskBreakdownSession(store, projectRoot);
+      // A popup was shown this prompt → the next prompts cannot display one, so preparing it would
+      // only produce a row the Stop hook discards — and, before this phase, spend the budget for it.
+      SessionStateManager.load(store, projectRoot).markPromptEnhancementPopupShown(store);
+      const request = makeBoundaryRequest(store, projectRoot);
+      const facadeResult = await preparePromptEnhancement(request);
+      const prepare = vi.fn().mockResolvedValue(asLlmWorded(facadeResult));
+
+      const result = await runAuto(
+        makeInput({ projectRoot }),
+        store,
+        makeMockOpenAI(FIRE_YES_RESPONSE, 'Hold up.'),
+        { request, prepare },
+      );
+
+      expect(prepare).not.toHaveBeenCalled();
+      expect(getPendingPromptEnhancement(store, projectRoot)).toBeNull();
+      // Nothing was charged: the signal stays eligible for the prompt after the cooldown.
+      const after = SessionStateManager.load(store, projectRoot);
+      expect(after.current.shownPopupCount).toBe(0);
+      expect(after.current.shownAdvisoryKeys).toEqual([]);
+      // Layer A (the advisory) is deliberately untouched — only the PE prepare is skipped.
+      expect(result).toEqual({ outcome: 'pending' });
+      expect(getPendingAdvisory(store, projectRoot)).not.toBeNull();
+    } finally {
+      store.db.close();
+    }
+  });
+
+  it('cooldown 0 (disabled): the prepare runs and the row is stored as before', async () => {
+    const store = await openStore(':memory:');
+    try {
+      const projectRoot = '/test/pe-cooldown-zero';
+      setConfig(store, 'advisory_frequency', 'optimum');
+      setConfig(store, 'prompt_enhancement.popup_cooldown', '0');
+      primeTaskBreakdownSession(store, projectRoot);
+      SessionStateManager.load(store, projectRoot).markPromptEnhancementPopupShown(store);
+      const request = makeBoundaryRequest(store, projectRoot);
+      const facadeResult = await preparePromptEnhancement(request);
+      const prepare = vi.fn().mockResolvedValue(asLlmWorded(facadeResult));
+
+      await runAuto(
+        makeInput({ projectRoot }),
+        store,
+        makeMockOpenAI(FIRE_YES_RESPONSE, 'Hold up.'),
+        { request, prepare },
+      );
+
+      expect(prepare).toHaveBeenCalledTimes(1);
+      expect(getPendingPromptEnhancement(store, projectRoot)).not.toBeNull();
+    } finally {
+      store.db.close();
+    }
   });
 });

@@ -47,6 +47,10 @@ import {
   type PromptEnhancementDeliveryResultV1,
 } from '../../prompt-enhancement/delivery.js';
 import { insertSkippedSession } from '../../store/skipped-sessions.js';
+import {
+  resolvePromptEnhancementPopupCooldownV1,
+  isPromptEnhancementPopupCooldownActiveV1,
+} from '../../prompt-enhancement/popup-cooldown.js';
 import { recordActivity } from '../../store/feedback-cadence.js';
 import { recordActionSignal } from '../../store/feedback-signals.js';
 import { writeTelemetry } from '../../telemetry/index.js';
@@ -1522,7 +1526,13 @@ export async function runAuto(
   const preCheckFiredKey = triggerResult.kind === 'stage_transition'
     ? buildFiredKey('stage_transition', prevStage, mgr.current.currentStage)
     : buildFiredKey(`absence:${triggerResult.qualifyingFlags[0]!.signalKey}` as FlagType, prevStage, mgr.current.currentStage);
-  const alreadyFired = mgr.hasFiredDecisionSession(preCheckFiredKey);
+  // Phase 1: under `countBudgetOnShow` the gate asks "was this advice SHOWN to the user?" instead of
+  // "did an advisory fire?" — an advisory whose popup was discarded must not block its own signal for
+  // the rest of the session. `firedDecisionSessions` keeps being written below either way, so the
+  // `once_per_session` level and the telemetry counters are untouched.
+  const alreadyFired = freqConfig.countBudgetOnShow
+    ? mgr.hasShownAdvisoryKeyV1(preCheckFiredKey)
+    : mgr.hasFiredDecisionSession(preCheckFiredKey);
   logger.debug('dedup', { firedKey: preCheckFiredKey, alreadyFired });
   if (alreadyFired) {
     // F4: this key already fired in the session
@@ -1569,7 +1579,12 @@ export async function runAuto(
   const advisoryCap = isVibeProfile
     ? freqConfig.sessionAdvisoryCapVibe
     : freqConfig.sessionAdvisoryCapDefault;
-  const advisoryCount = mgr.current.advisoryCount ?? 0;
+  // Phase 1: the ceiling counts popups the user actually SAW under `countBudgetOnShow`; otherwise it
+  // counts advisories that fired, popup or not. `advisoryCount` is still incremented either way, so
+  // `advisoryCountInSession` telemetry keeps its historical meaning.
+  const advisoryCount = freqConfig.countBudgetOnShow
+    ? (mgr.current.shownPopupCount ?? 0)
+    : (mgr.current.advisoryCount ?? 0);
   if (advisoryCount >= advisoryCap) {
     // F4: the session advisory cap is reached
     await prepareSequenceShapedPeFallback('blocked_by_session_cap');
@@ -1636,110 +1651,130 @@ export async function runAuto(
   // the executable owner-spec facade without changing legacy DS or delivery authority.
   // A3 step 7: mine-and-cache before the request is built, so freshly mined values are in the
   // store when the boundary reads them. One-shot and threshold-gated; see the closure above.
-  await ensurePromptFactsFresh();
-  const peIntegration = promptEnhancement ?? {
-    request: buildPromptEnhancementRequestForAuto({
-      auto: input,
-      store,
-      session: mgr,
-      project,
-      effectiveLanguage: effectiveLang,
-      configuredRole,
-      effectiveFlagType,
-      firedKey,
-      previousStage: prevStage,
-      trigger: triggerResult,
-      stageResult,
-      // F4: this path is reached only after frequency, dedup, cooldown, cap and the
-      // classifier fire-recommendation have ALL passed — so the trigger is cleanly eligible,
-      // UNLESS the user already dismissed this very signal. `dismissedAtIndex` is set on the
-      // absence flag when the user acts on it, and L4991 names dismissal as a state that must
-      // not anchor a popup — so the one locked value that had no producer now has one, read
-      // from session state rather than inferred.
-      triggerEligibility: promptEnhancementFiredTriggerEligibilityV1(mgr.current.absenceFlags, effectiveFlagType),
-      streamBOutputs: streamBOverrides
-        ? Object.entries(streamBOverrides)
-          .filter(([, present]) => present)
-          .map(([signal]) => `stream_b:${signal}`)
-        : [],
-    }),
-    prepare: preparePromptEnhancementForRunAuto,
-  };
-  const preparation = await preparePromptEnhancementForAuto(peIntegration);
-  await peIntegration.onResult?.(preparation);
-  logger.debug('prompt_enhancement_prepare_boundary', {
-    disposition: preparation.disposition,
-    safeFallback: preparation.safeFallback,
-    reasonCode: 'reasonCode' in preparation ? preparation.reasonCode : undefined,
-    // Diagnosability (2026-08-06): a bare invalid_result was undebuggable from the log — record
-    // WHICH validation checks failed so a live boundary rejection names its exact cause.
-    validationReasonCodes: 'validationReasonCodes' in preparation && preparation.validationReasonCodes
-      ? preparation.validationReasonCodes.slice(0, 10)
-      : undefined,
-    blockedFailureCodes: blockedFailureCodesForLog(preparation),
-    // ⚠️ BOTH of these were on the sequence-shaped boundary log and NOT here — the MAIN path, which
-    // is the common one. So the deterministic-popup suppression and the I1 ordering count were
-    // observable only on the rarer route, which is the same one-of-two-sites shape the persistence
-    // gate had. Kept identical to the other site on purpose: two logs of the same event that report
-    // different fields cannot be read together.
-    suppressedReason: promptEnhancementBodyHasNoLlmWordingV1(preparation.result)
-      ? 'deterministic_only_no_llm_wording'
-      : undefined,
-    classifierDegraded: stageResult.degraded,
-    relevanceOrderCount: stageResult.sectionRelevanceOrder.length,
-    // Kept identical to the sequence-shaped site above on purpose: two logs of the same event that
-    // report different fields cannot be read together.
-    prunedSectionCount: preparation.result?.prunedSectionCount,
-    floorSectionCount: preparation.result?.floorSectionCount,
-  });
-  // Owner decision B-i (2026-08-04): the PE popup is deferred to the Stop hook. Do NOT show a
-  // popup on UserPromptSubmit — the prompt passes through raw. When a real (non-fallback) result
-  // exists, persist it so the Stop hook can show the PE popup after Claude responds.
-  // Phase 4 (defense-in-depth): but NOT an unshowable one — a `no_popup` display decision
-  // (`no_popup_not_applicable` disposition or `no_popup` send policy) would spawn a window at Stop that
-  // the child declines (the "blink"). Phase 1's launcher gate already blocks the spawn; skipping the row
-  // here removes it at the source. Same condition the UI boundary uses; the skip stays traceable via the
-  // `prompt_enhancement_prepare_boundary` log above (no `..._stored` log follows).
-  const displayDecisionIsNoPopup = preparation.result?.disposition === 'no_popup_not_applicable'
-    || preparation.result?.uiView.body.sendPolicy === 'no_popup'
-    // Owner ruling (a): a body with no LLM wording is boilerplate, and boilerplate does not
-    // earn a popup. Same row, same gate as the blink fix above.
-    || promptEnhancementBodyHasNoLlmWordingV1(preparation.result);
-  if (!preparation.safeFallback && preparation.result && !displayDecisionIsNoPopup) {
-    upsertPendingPromptEnhancement(store, {
-      projectRoot: input.projectRoot,
-      sessionId:   mgr.current.sessionId,
-      promptCount: mgr.current.promptCount,
-      request:     peIntegration.request,
-      result:      preparation.result,
-      // P1b-ii: carry the planner item list + whole-prompt directive ranges (set by the closure
-      // during this prepare) so the Stop-hook batch can word items 2…N. Undefined on non-sequence
-      // prepares → NULL columns.
-      plannerItems: capturedPlannerItems,
-      plannerPromptDirectives: capturedPlannerPromptDirectives,
-    });
-    const handoffPresent = Boolean(preparation.result.uiView.handoffAndSequenceSummary);
-    logger.debug('pending_prompt_enhancement_stored', {
-      projectRoot: input.projectRoot,
-      sessionId:   mgr.current.sessionId,
-      promptCount: mgr.current.promptCount,
+  // Phase 1 (prepare-time cooldown): while the popup cooldown is active, a popup prepared now
+  // cannot be displayed — the Stop hook would consume it unseen. Skipping the preparation saves
+  // that composer call, and because the budget is charged on show the signal stays eligible to
+  // return once the window has passed. Legacy DS bookkeeping below is untouched.
+  const pePopupCooldownActive = freqConfig.countBudgetOnShow
+    && isPromptEnhancementPopupCooldownActiveV1(
+      mgr.current.lastPromptEnhancementPromptIndex ?? -1,
+      mgr.current.promptCount,
+      resolvePromptEnhancementPopupCooldownV1(store, input.projectRoot),
+    );
+  let preparation: AutoPromptEnhancementPreparationResult | undefined;
+  if (!pePopupCooldownActive) {
+    await ensurePromptFactsFresh();
+    const peIntegration = promptEnhancement ?? {
+      request: buildPromptEnhancementRequestForAuto({
+        auto: input,
+        store,
+        session: mgr,
+        project,
+        effectiveLanguage: effectiveLang,
+        configuredRole,
+        effectiveFlagType,
+        firedKey,
+        previousStage: prevStage,
+        trigger: triggerResult,
+        stageResult,
+        // F4: this path is reached only after frequency, dedup, cooldown, cap and the
+        // classifier fire-recommendation have ALL passed — so the trigger is cleanly eligible,
+        // UNLESS the user already dismissed this very signal. `dismissedAtIndex` is set on the
+        // absence flag when the user acts on it, and L4991 names dismissal as a state that must
+        // not anchor a popup — so the one locked value that had no producer now has one, read
+        // from session state rather than inferred.
+        triggerEligibility: promptEnhancementFiredTriggerEligibilityV1(mgr.current.absenceFlags, effectiveFlagType),
+        streamBOutputs: streamBOverrides
+          ? Object.entries(streamBOverrides)
+            .filter(([, present]) => present)
+            .map(([signal]) => `stream_b:${signal}`)
+          : [],
+      }),
+      prepare: preparePromptEnhancementForRunAuto,
+    };
+    preparation = await preparePromptEnhancementForAuto(peIntegration);
+    await peIntegration.onResult?.(preparation);
+    logger.debug('prompt_enhancement_prepare_boundary', {
       disposition: preparation.disposition,
-      // Diagnosability: whether this stored row can ever open the MPS popup.
-      handoffPresent,
+      safeFallback: preparation.safeFallback,
+      reasonCode: 'reasonCode' in preparation ? preparation.reasonCode : undefined,
+      // Diagnosability (2026-08-06): a bare invalid_result was undebuggable from the log — record
+      // WHICH validation checks failed so a live boundary rejection names its exact cause.
+      validationReasonCodes: 'validationReasonCodes' in preparation && preparation.validationReasonCodes
+        ? preparation.validationReasonCodes.slice(0, 10)
+        : undefined,
+      blockedFailureCodes: blockedFailureCodesForLog(preparation),
+      // ⚠️ BOTH of these were on the sequence-shaped boundary log and NOT here — the MAIN path, which
+      // is the common one. So the deterministic-popup suppression and the I1 ordering count were
+      // observable only on the rarer route, which is the same one-of-two-sites shape the persistence
+      // gate had. Kept identical to the other site on purpose: two logs of the same event that report
+      // different fields cannot be read together.
+      suppressedReason: promptEnhancementBodyHasNoLlmWordingV1(preparation.result)
+        ? 'deterministic_only_no_llm_wording'
+        : undefined,
+      classifierDegraded: stageResult.degraded,
+      relevanceOrderCount: stageResult.sectionRelevanceOrder.length,
+      // Kept identical to the sequence-shaped site above on purpose: two logs of the same event that
+      // report different fields cannot be read together.
+      prunedSectionCount: preparation.result?.prunedSectionCount,
+      floorSectionCount: preparation.result?.floorSectionCount,
     });
-    // A sequence-shaped prompt that stored WITHOUT a summary is the exact anomaly that was
-    // previously untraceable — name the reason (deterministic re-explain) in the log.
-    if (!handoffPresent && isPromptEnhancementSequenceShapedTextV1(input.promptText)) {
-      logger.warn('sequence_summary_absent', {
+    // Owner decision B-i (2026-08-04): the PE popup is deferred to the Stop hook. Do NOT show a
+    // popup on UserPromptSubmit — the prompt passes through raw. When a real (non-fallback) result
+    // exists, persist it so the Stop hook can show the PE popup after Claude responds.
+    // Phase 4 (defense-in-depth): but NOT an unshowable one — a `no_popup` display decision
+    // (`no_popup_not_applicable` disposition or `no_popup` send policy) would spawn a window at Stop that
+    // the child declines (the "blink"). Phase 1's launcher gate already blocks the spawn; skipping the row
+    // here removes it at the source. Same condition the UI boundary uses; the skip stays traceable via the
+    // `prompt_enhancement_prepare_boundary` log above (no `..._stored` log follows).
+    const displayDecisionIsNoPopup = preparation.result?.disposition === 'no_popup_not_applicable'
+      || preparation.result?.uiView.body.sendPolicy === 'no_popup'
+      // Owner ruling (a): a body with no LLM wording is boilerplate, and boilerplate does not
+      // earn a popup. Same row, same gate as the blink fix above.
+      || promptEnhancementBodyHasNoLlmWordingV1(preparation.result);
+    if (!preparation.safeFallback && preparation.result && !displayDecisionIsNoPopup) {
+      upsertPendingPromptEnhancement(store, {
         projectRoot: input.projectRoot,
-        reasonCodes: explainPromptEnhancementSequenceSummaryAbsenceV1(peIntegration.request, preparation.result).slice(0, 8),
+        sessionId:   mgr.current.sessionId,
+        promptCount: mgr.current.promptCount,
+        request:     peIntegration.request,
+        result:      preparation.result,
+        // P1b-ii: carry the planner item list + whole-prompt directive ranges (set by the closure
+        // during this prepare) so the Stop-hook batch can word items 2…N. Undefined on non-sequence
+        // prepares → NULL columns.
+        plannerItems: capturedPlannerItems,
+        plannerPromptDirectives: capturedPlannerPromptDirectives,
       });
+      const handoffPresent = Boolean(preparation.result.uiView.handoffAndSequenceSummary);
+      logger.debug('pending_prompt_enhancement_stored', {
+        projectRoot: input.projectRoot,
+        sessionId:   mgr.current.sessionId,
+        promptCount: mgr.current.promptCount,
+        disposition: preparation.disposition,
+        // Diagnosability: whether this stored row can ever open the MPS popup.
+        handoffPresent,
+      });
+      // A sequence-shaped prompt that stored WITHOUT a summary is the exact anomaly that was
+      // previously untraceable — name the reason (deterministic re-explain) in the log.
+      if (!handoffPresent && isPromptEnhancementSequenceShapedTextV1(input.promptText)) {
+        logger.warn('sequence_summary_absent', {
+          projectRoot: input.projectRoot,
+          reasonCodes: explainPromptEnhancementSequenceSummaryAbsenceV1(peIntegration.request, preparation.result).slice(0, 8),
+        });
+      }
+      // E9 (P12-G1/G2): measure cost off the result's REAL call-visibility (mode + planned/used
+      // counts come from the composer, not the hardcoded request placeholder), and run the the provider-failure contract
+      // "cost never weakens behavior" check. Observability-only — this never gates the popup. The
+      // E8 popup-action calls are measured at their own surface via the popup costObservabilitySink.
+      emitPromptEnhancementCostObservabilityV1(preparation.result, 'prepare', logger);
+      // Phase 1: remember what this row would cost if it is ever SHOWN. Both keys travel, because the
+      // dedup gate checks `preCheckFiredKey` (first qualifying flag) while the row carries `firedKey`
+      // (the flag Stage 2 selected) — charging only the second would leave the first uncharged for
+      // ever, and an uncharged key never blocks.
+      if (freqConfig.countBudgetOnShow) {
+        mgr.markPendingPopupChargeKeysV1(store, [preCheckFiredKey, firedKey]);
+      }
     }
-    // E9 (P12-G1/G2): measure cost off the result's REAL call-visibility (mode + planned/used
-    // counts come from the composer, not the hardcoded request placeholder), and run the the provider-failure contract
-    // "cost never weakens behavior" check. Observability-only — this never gates the popup. The
-    // E8 popup-action calls are measured at their own surface via the popup costObservabilitySink.
-    emitPromptEnhancementCostObservabilityV1(preparation.result, 'prepare', logger);
   }
 
   // keeps legacy Decision Session bookkeeping after preparation; PE preparation
@@ -1780,7 +1815,8 @@ export async function runAuto(
     sessionId: mgr.current.sessionId,
     promptCount: mgr.current.promptCount,
     flagType: effectiveFlagType,
-    peDisposition: preparation.disposition,
+    // Phase 1: `undefined` when the popup cooldown made a preparation pointless this turn.
+    peDisposition: preparation?.disposition,
   });
   writeTelemetry(input.projectRoot, 'pipeline_advisory_pending', {
     flagType:                      effectiveFlagType,

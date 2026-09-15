@@ -118,6 +118,26 @@ export interface SessionState {
    */
   advisoryCount?: number;
   /**
+   * Keys of advisories whose PE / MPS-1 popup was actually SHOWN to the user this session.
+   * The dedup gate reads THIS instead of `firedDecisionSessions` when the frequency level sets
+   * `countBudgetOnShow`: an advisory the user never saw must not block its own signal later.
+   * `firedDecisionSessions` keeps being written either way, so `once_per_session` and telemetry
+   * are unchanged. Optional — absent on state written before this field existed.
+   */
+  shownAdvisoryKeys?: string[];
+  /**
+   * Count of PE / MPS-1 popups actually SHOWN this session. The session cap reads THIS instead of
+   * `advisoryCount` when the frequency level sets `countBudgetOnShow`. Optional — read as 0 when absent.
+   */
+  shownPopupCount?: number;
+  /**
+   * Keys to charge if the pending PE row is shown. Written when the row is stored, consumed at the
+   * moment the popup is displayed. It carries BOTH the dedup pre-check key (built from the first
+   * qualifying flag) and the fired key (built from the classifier's selected flag), because those two
+   * can differ and the row itself only carries the second one. Optional; cleared after each charge.
+   */
+  pendingPopupChargeKeys?: string[];
+  /**
    * Number of consecutive prompts processed without a correction_seeking signal being detected.
    * Resets to 0 whenever correction_seeking is detected in a prompt; increments on every other prompt.
    * Used by the decision_fatigue_pattern signal detector.

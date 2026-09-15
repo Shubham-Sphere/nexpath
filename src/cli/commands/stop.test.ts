@@ -768,3 +768,71 @@ describe('persistPromptEnhancementSequenceContinuationCancelV1 — 6.5 §5b dest
     expect(projRows()).toBe(1);
   });
 });
+
+// ── Phase 1 — the session budget is charged at the moment a popup is SHOWN ────
+//
+// The auto hook writes the keys to charge with the pending row; the Stop hook spends them only when
+// the popup actually reaches the user. A row that is prepared and never displayed costs nothing, which
+// is what stops a discarded popup from silencing its own signal for the rest of the session.
+
+describe('runStop — shown-popup budget charge (Phase 1)', () => {
+  let store: Store;
+  beforeEach(async () => { store = await openStore(':memory:'); });
+  afterEach(() => { store.db.close(); });
+
+  const inject = (text: string): PromptEnhancementStopLaunchFn => vi.fn().mockResolvedValue({ kind: 'inject', text });
+  const shown = (): PromptEnhancementStopLaunchFn => vi.fn().mockResolvedValue({ kind: 'shown' });
+  const notShown = (): PromptEnhancementStopLaunchFn => vi.fn().mockResolvedValue({ kind: 'not_shown' });
+
+  /** The key the pending-PE fixture carries — what the charge must record. */
+  const FIXTURE_KEY = 'stage_transition:idea→implementation';
+
+  it('charges on the inject path (Use enhanced)', async () => {
+    await insertPendingPe(store);
+    await runStop(makePayload(), store, undefined, undefined, undefined, inject('ENHANCED BODY'));
+    const mgr = SessionStateManager.load(store, '/test/project');
+    expect(mgr.current.shownPopupCount).toBe(1);
+    expect(mgr.hasShownAdvisoryKeyV1(FIXTURE_KEY)).toBe(true);
+  });
+
+  it('charges on the shown path too — dismiss and use-original still mean the user saw the guidance', async () => {
+    await insertPendingPe(store);
+    await runStop(makePayload(), store, undefined, undefined, undefined, shown());
+    const mgr = SessionStateManager.load(store, '/test/project');
+    expect(mgr.current.shownPopupCount).toBe(1);
+    expect(mgr.hasShownAdvisoryKeyV1(FIXTURE_KEY)).toBe(true);
+  });
+
+  it('charges nothing when no host could display it (not_shown) — the row stays pending', async () => {
+    await insertPendingPe(store);
+    await runStop(makePayload(), store, undefined, undefined, undefined, notShown());
+    const mgr = SessionStateManager.load(store, '/test/project');
+    expect(mgr.current.shownPopupCount).toBe(0);
+    expect(mgr.current.shownAdvisoryKeys).toEqual([]);
+    expect(getPendingPromptEnhancement(store, '/test/project')).not.toBeNull();
+  });
+
+  it('charges nothing when the popup cooldown suppresses it — the key stays spendable later', async () => {
+    await insertPendingPe(store);
+    SessionStateManager.load(store, '/test/project').markPromptEnhancementPopupShown(store);
+    const launch = inject('SHOULD NOT SHOW');
+    await runStop(makePayload(), store, undefined, undefined, undefined, launch);
+    expect(launch).not.toHaveBeenCalled();
+    const mgr = SessionStateManager.load(store, '/test/project');
+    expect(mgr.current.shownPopupCount).toBe(0);
+    expect(mgr.hasShownAdvisoryKeyV1(FIXTURE_KEY)).toBe(false);
+  });
+
+  it('a gated MPS continuation charges nothing — nothing was rendered', async () => {
+    const session = SessionStateManager.load(store, '/test/project');
+    session.setDetectedLanguage(store, undefined);
+    upsertPendingPromptSequence(store, {
+      sequenceId: 'seq-charge', enhancementId: 'enh-charge', projectRoot: '/test/project',
+      sessionId: session.current.sessionId, itemCount: 3, currentItemIndex: 1,
+      status: 'item_pending', lastActionId: 'prev',
+    }, emptyPromptEnhancementSequencePayloadV1(64));
+    const result = await runStop(makePayload({ stop_hook_active: true }), store, undefined, undefined, undefined, notShown());
+    expect(result).toEqual({ outcome: 'mps_continuation_gated' });
+    expect(SessionStateManager.load(store, '/test/project').current.shownPopupCount).toBe(0);
+  });
+});

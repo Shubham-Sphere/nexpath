@@ -16,6 +16,16 @@ export interface FrequencyLevelConfig {
   signalAbsenceThresholdMultiplier: number;
   minStageChangeConfidence: number;
   signalAbsenceMinFloor: number;
+  /**
+   * Charge the session budget when a popup is SHOWN rather than when an advisory FIRES.
+   *
+   * `false` keeps the historical behaviour exactly: the dedup gate reads `firedDecisionSessions` and
+   * the session cap reads `advisoryCount`, both written the moment an advisory fires — even when the
+   * popup behind it is never displayed. `true` makes both gates read the shown-popup state instead,
+   * so an advisory whose popup was discarded costs nothing, and the auto pipeline skips preparing a
+   * popup while the popup cooldown makes it undisplayable anyway.
+   */
+  countBudgetOnShow: boolean;
 }
 
 export const OPTIMUM_LEVEL_CONFIG: Readonly<FrequencyLevelConfig> = {
@@ -29,6 +39,7 @@ export const OPTIMUM_LEVEL_CONFIG: Readonly<FrequencyLevelConfig> = {
   signalAbsenceThresholdMultiplier: 0.25,
   minStageChangeConfidence:         0.50,
   signalAbsenceMinFloor:             2,
+  countBudgetOnShow:              true,
 };
 
 export const FREQUENCY_LEVEL_CONFIGS: Record<AdvisoryFrequencyLevel, FrequencyLevelConfig> = {
@@ -43,6 +54,7 @@ export const FREQUENCY_LEVEL_CONFIGS: Record<AdvisoryFrequencyLevel, FrequencyLe
     signalAbsenceThresholdMultiplier:  1.0,
     minStageChangeConfidence:          0.50,
     signalAbsenceMinFloor:               5,
+    countBudgetOnShow:               false,
   },
   major_only: {
     minPromptsBeforeAdvisory:            5,
@@ -55,6 +67,7 @@ export const FREQUENCY_LEVEL_CONFIGS: Record<AdvisoryFrequencyLevel, FrequencyLe
     signalAbsenceThresholdMultiplier:  1.0,
     minStageChangeConfidence:          0.50,
     signalAbsenceMinFloor:               5,
+    countBudgetOnShow:               false,
   },
   once_per_session: {
     minPromptsBeforeAdvisory:           10,
@@ -67,6 +80,7 @@ export const FREQUENCY_LEVEL_CONFIGS: Record<AdvisoryFrequencyLevel, FrequencyLe
     signalAbsenceThresholdMultiplier:  1.0,
     minStageChangeConfidence:          0.50,
     signalAbsenceMinFloor:               5,
+    countBudgetOnShow:               false,
   },
   every_event: {
     minPromptsBeforeAdvisory:            3,
@@ -79,6 +93,7 @@ export const FREQUENCY_LEVEL_CONFIGS: Record<AdvisoryFrequencyLevel, FrequencyLe
     signalAbsenceThresholdMultiplier:  1.0,
     minStageChangeConfidence:          0.50,
     signalAbsenceMinFloor:               5,
+    countBudgetOnShow:               false,
   },
   optimum: OPTIMUM_LEVEL_CONFIG,
 };
