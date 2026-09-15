@@ -4002,6 +4002,10 @@ describe('runAuto — budget counted on show (optimum level)', () => {
       signalKey: 'test_creation', stage: 'implementation', raisedAtIndex: 0, cooldownUntil: 100,
     });
     const debugSpy = vi.spyOn(logger, 'debug');
+    // The telemetry mock is module-level and its call history spans the whole file: without a clear,
+    // the positive assertion below could be satisfied by some OTHER test's dedup block, and the
+    // negative one broken by it. Both must speak about THIS run only.
+    vi.mocked(writeTelemetry).mockClear();
     await runAuto(makeInput({ projectRoot }), store, makeMockOpenAI(FIRE_YES_RESPONSE, 'Hold up.'));
     return debugSpy;
   }
