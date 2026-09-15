@@ -164,3 +164,20 @@ describe('GlobalConfig — OPTIMUM_LEVEL_CONFIG cap values (Stream C validation)
     expect(cap * 15).toBeGreaterThanOrEqual(385);
   });
 });
+
+// ── countBudgetOnShow — which levels charge the budget on show (Phase 1) ─────
+
+describe('GlobalConfig — countBudgetOnShow', () => {
+  it('optimum charges the budget when a popup is SHOWN', () => {
+    expect(OPTIMUM_LEVEL_CONFIG.countBudgetOnShow).toBe(true);
+  });
+
+  it('every other level keeps charging at fire time', () => {
+    // The phase ships on one level only. A new level that silently defaults to the show-counting
+    // behaviour would change dedup and the cap on a surface nobody measured — so every level is
+    // listed here by name rather than checked as "not optimum".
+    for (const level of ['off', 'major_only', 'once_per_session', 'every_event'] as const) {
+      expect(FREQUENCY_LEVEL_CONFIGS[level].countBudgetOnShow, level).toBe(false);
+    }
+  });
+});
