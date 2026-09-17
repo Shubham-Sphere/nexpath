@@ -1584,9 +1584,19 @@ export async function runAuto(
   // guidance facts, the fatigue keys and the popup body the user reads — it stays byte-identical.
   // Stage transitions keep today's dedup on purpose: they have no flag lifecycle, and the classifier
   // oscillates between stages, which is the noise dedup was added for in the first place.
+  //
+  // ⚠️ The qualifying flags are passed ALONGSIDE the session's own: on the fresh-raise path they have
+  // not been persisted yet (that happens at 6.8, below this gate), while the fired key built after it
+  // sees them. Without them the two would name different occurrences at a window boundary — the gate
+  // reading an absorbed raise that is still inside its own window, the fired key reading the new
+  // window the fresh raise opens. A charge recorded under one and checked under the other blocks a
+  // genuinely new occurrence. Duplicates are harmless: a repeated raise is absorbed by its own window.
+  const occurrenceFlags = triggerResult.kind === 'absence'
+    ? [...mgr.current.absenceFlags, ...triggerResult.qualifyingFlags]
+    : mgr.current.absenceFlags;
   const dedupKey = triggerResult.kind === 'absence'
     ? `${preCheckFiredKey}#${absenceOccurrenceIndexV1(
-        mgr.current.absenceFlags,
+        occurrenceFlags,
         triggerResult.qualifyingFlags[0]!.signalKey,
         mgr.current.promptCount,
       ) ?? triggerResult.qualifyingFlags[0]!.raisedAtIndex}`
@@ -1712,7 +1722,9 @@ export async function runAuto(
       ? stageResult.selectedSignalKey
       : triggerResult.qualifyingFlags[0]!.signalKey;
     effectiveFlagType = `absence:${selectedKey}`;
-    selectedRaisedAtIndex = absenceOccurrenceIndexV1(mgr.current.absenceFlags, selectedKey, mgr.current.promptCount)
+    // Same list the gate used, for the same reason — by now 6.8 has persisted the fresh raises, so
+    // the duplicates this introduces are absorbed rather than counted twice.
+    selectedRaisedAtIndex = absenceOccurrenceIndexV1(occurrenceFlags, selectedKey, mgr.current.promptCount)
       ?? (triggerResult.qualifyingFlags.find((f) => f.signalKey === selectedKey)
         ?? triggerResult.qualifyingFlags[0]!).raisedAtIndex;
   }

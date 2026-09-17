@@ -4399,6 +4399,30 @@ describe('runAuto — occurrence dedup (Phase 2)', () => {
     );
   });
 
+  it('and BOTH key sites resolve the occurrence from the SAME list — pinned in the source', () => {
+    // ⚠️ Honest about what this proves. The behavioural fixtures above drive the condition-3 path,
+    // where the qualifying flags are already in session state and concatenating them is a no-op — so
+    // no test in this file can fail when the call site stops passing them. A mutation confirmed the
+    // gap: dropping `...triggerResult.qualifyingFlags` left every test green.
+    //
+    // The divergence it causes is unit-tested on the helper ("a pending raise must be counted"). What
+    // is pinned HERE is the wiring: the gate runs before step 6.8 persists fresh raises and the fired
+    // key is built after it, so the only way the two can agree is by reading one prepared list. A
+    // second `absenceOccurrenceIndexV1` call that reaches for `mgr.current.absenceFlags` directly is
+    // the shape that breaks it, and it fails here with the reason why.
+    const source = readFileSync('src/cli/commands/auto.ts', 'utf8');
+    const lookups = source.split('absenceOccurrenceIndexV1(').length - 1;
+    const fromPreparedList = source.split('absenceOccurrenceIndexV1(\n        occurrenceFlags,').length - 1
+      + source.split('absenceOccurrenceIndexV1(occurrenceFlags,').length - 1;
+    // one of the occurrences is the function's own declaration
+    expect(
+      fromPreparedList,
+      `${lookups - 1} occurrence lookups exist and ${fromPreparedList} read the prepared list — one `
+      + 'reading session state directly would name a different occurrence than the other at a window '
+      + 'boundary, and the popup would be charged under one key and checked under the other',
+    ).toBe(lookups - 1);
+  });
+
   it('a stage transition keeps whole-session dedup — no suffix on its key', async () => {
     // Transitions have no flag lifecycle, and the classifier oscillates between stages, which is the
     // noise dedup was added for. Deliberately excluded from the change.
@@ -4493,6 +4517,38 @@ describe('absenceOccurrenceIndexV1', () => {
     }
     // …and the sorted answer is the one that treats 35 as part of the window 10 opened.
     expect(absenceOccurrenceIndexV1(clean, 'x', 38)).toBe(10);
+  });
+
+  it('⛔ a pending raise must be counted, or the gate and the fired key name different occurrences', () => {
+    // The gate runs BEFORE freshly-raised flags are persisted (auto.ts step 6.8) and the fired key is
+    // built AFTER, so the two see different lists unless the pending raises travel with them.
+    //
+    // At a window boundary that difference is not cosmetic. B-11 leaves absorbed raises lying around
+    // whose own windows outlive the window that swallowed them, so the gate would read one of those —
+    // an occurrence already charged — while the fired key reads the new window the fresh raise opens.
+    // The popup is then charged under one key and checked under the other, and the next genuinely new
+    // occurrence is refused.
+    const mk = (i: number) => ({ signalKey: 'x', raisedAtIndex: i, cooldownUntil: i + COOLDOWN });
+    const persisted = [mk(0), mk(20)];   // 20 was absorbed by 0's window but its own runs to 50
+    const pending = mk(30);              // raised this prompt, not yet in session state
+
+    expect(absenceOccurrenceIndexV1(persisted, 'x', 30), 'what the gate would see alone').toBe(20);
+    expect(absenceOccurrenceIndexV1([...persisted, pending], 'x', 30), 'what the fired key sees').toBe(30);
+    // …so the gate has to be handed the pending raise, which is what the call site does.
+    expect(absenceOccurrenceIndexV1([...persisted, pending], 'x', 30))
+      .toBe(absenceOccurrenceIndexV1([...persisted, pending], 'x', 30));
+  });
+
+  it('a duplicate raise changes nothing — the concatenated list may repeat a flag', () => {
+    // On the condition-3 path the qualifying flags are ALREADY in session state, so the call site
+    // hands the helper the same flag twice. A repeat must be absorbed by its own window, not counted.
+    const mk = (i: number) => ({ signalKey: 'x', raisedAtIndex: i, cooldownUntil: i + COOLDOWN });
+    const once = [mk(10), mk(60)];
+    const twice = [mk(10), mk(60), mk(10), mk(60)];
+    for (const p of [10, 30, 39, 45, 60, 80]) {
+      expect(absenceOccurrenceIndexV1(twice, 'x', p), `prompt ${p}`)
+        .toBe(absenceOccurrenceIndexV1(once, 'x', p));
+    }
   });
 
   it('an empty flag list answers undefined rather than throwing', () => {
