@@ -4166,3 +4166,251 @@ describe('runAuto — PE prepare is skipped while the popup cooldown is active (
     }
   });
 });
+
+// ── Phase 2 — dedup blocks the OCCURRENCE, not the signal ────────────────────
+//
+// A key that fired once was blocked for the whole session: the list held no time, so "allow it again
+// later" could not even be expressed. Measured on the bug report's run,
+// `absence:cross_confirming@implementation` fired at #23 and was then refused 56 times, up to #330.
+// The absence detector already re-raises a flag when the practice is STILL missing after its cooldown,
+// and every raise carries its own `raisedAtIndex` — that re-raise is the "this is happening again"
+// event, so the dedup list keys on it rather than inventing a TTL.
+
+describe('runAuto — occurrence dedup (Phase 2)', () => {
+  let store: Store;
+
+  beforeEach(async () => { store = await openStore(':memory:'); });
+  afterEach(() => { store.db.close(); vi.restoreAllMocks(); });
+
+  /** Stage-1 scores this weakly, so it does not drag the session out of `implementation`. */
+  const LOW_SIGNAL_PROMPT = 'ok sure go ahead';
+
+  /**
+   * A firing reply at exactly `optimum`'s `stage2MinConfidence`.
+   *
+   * 0.40 is the lowest confidence whose fire recommendation survives the parser, and it has to be the
+   * lowest: the session confidence is an EMA of this value, and condition 3 of the trigger only runs
+   * while that EMA is under 0.25. Anything higher and the absence path becomes unreachable.
+   */
+  const absenceFireReply = (confidence: number) => ({
+    stage:                 'Implementation',
+    stage_confidence:      confidence,
+    signals_present:       [],
+    signals_absent:        ['test_creation'],
+    fire_decision_session: true,
+    selected_signal_key:   'test_creation',
+    reason:                'test_creation missing.',
+  });
+
+  /**
+   * Answer EVERY call with the same valid stage reply.
+   *
+   * `makeMockOpenAI` answers the second call with the pinch string, and more than one component asks
+   * the model per prompt — so whichever call the stage classifier happens to make, it must parse. With
+   * the shared mock it received the pinch text, degraded, and a degraded classifier never recommends
+   * firing, which made the whole absence path unreachable.
+   */
+  function makeAlwaysFiringOpenAI(confidence: number): OpenAI {
+    return {
+      chat: {
+        completions: {
+          create: vi.fn().mockResolvedValue({
+            choices: [{ message: { content: JSON.stringify(absenceFireReply(confidence)) } }],
+          }),
+        },
+      },
+    } as unknown as OpenAI;
+  }
+
+  /**
+   * Park a session in `implementation` with EVERY signal already flagged.
+   *
+   * That makes the detector raise nothing new, so trigger condition 2 stays empty and condition 3 runs
+   * instead, picking `absenceFlags[0]` — the flag under test, placed first — on every prompt. Without
+   * it the live detector raises a different signal each prompt and the key under test never repeats,
+   * which is exactly what these tests need to hold still.
+   */
+  function primeStableAbsenceSession(projectRoot: string, raisedAtIndex = 2): void {
+    const prime = SessionStateManager.load(store, projectRoot);
+    // Three prompts, not one: `every_event` will not consider an advisory before the third.
+    for (let i = 0; i < 3; i++) {
+      prime.processPrompt(store, IMPL_PROMPT, { stage: 'implementation', confidence: 0.9, tier: 3, allScores: {} });
+    }
+    // Without a profile the LLM profile classifier runs first and consumes a reply; the stage
+    // classifier is fed enough by the mock above, but this also matches `primeTaskBreakdownSession`.
+    prime.setProfile(buildSafeDefaults(100));
+    const st = (prime as unknown as {
+      state: { absenceFlags: unknown[]; signalCounters: Record<string, unknown> };
+    }).state;
+    st.absenceFlags = [
+      { signalKey: 'test_creation', stage: 'implementation', raisedAtIndex, cooldownUntil: 9999 },
+      ...Object.keys(st.signalCounters)
+        .filter((k) => k !== 'test_creation')
+        .map((k) => ({ signalKey: k, stage: 'implementation', raisedAtIndex, cooldownUntil: 9999 })),
+    ];
+    prime.setDetectedLanguage(store, undefined);   // persists everything set above
+  }
+
+  const dedupCalls = (spy: { mock: { calls: unknown[][] } }) =>
+    spy.mock.calls
+      .filter((c) => c[0] === 'dedup')
+      .map((c) => c[1] as { firedKey: string; dedupKey: string; alreadyFired: boolean });
+
+  /**
+   * One prompt through the real pipeline, returning what the dedup gate decided.
+   *
+   * The session confidence is pinned low first because it is an EMA that climbs toward the reply's
+   * 0.40 — after two prompts it would cross condition 3's gate and the absence path would vanish
+   * mid-test. Holding it still keeps the ONE thing under test — the dedup key — the only thing moving.
+   */
+  async function fireOnce(projectRoot: string, confidence = 0.40) {
+    const mgr = SessionStateManager.load(store, projectRoot);
+    (mgr as unknown as { state: { stageConfidence: number } }).state.stageConfidence = 0.05;
+    mgr.setDetectedLanguage(store, undefined);
+    const spy = vi.spyOn(logger, 'debug');
+    const outcome = await runAuto(
+      makeInput({ projectRoot, promptText: LOW_SIGNAL_PROMPT }),
+      store,
+      makeAlwaysFiringOpenAI(confidence),
+    );
+    const calls = dedupCalls(spy);
+    spy.mockRestore();
+    return { ...calls.at(-1)!, outcome };
+  }
+
+  it('keys the dedup list on the occurrence, and leaves firedKey untouched', async () => {
+    const projectRoot = '/test/p2-key-shape';
+    setConfig(store, 'advisory_frequency', 'optimum');
+    primeStableAbsenceSession(projectRoot, 2);
+
+    const seen = await fireOnce(projectRoot);
+    expect(seen.outcome, 'the fixture must actually fire, or the rest proves nothing').toEqual({ outcome: 'pending' });
+    // 🔒 The suffix must live ONLY in the dedup key. `firedKey` is read by the PE request, the router,
+    // the guidance facts, the fatigue keys and the popup body the user reads — a suffix there would
+    // surface in rendered text, which is why the plan froze its format.
+    expect(seen.firedKey).toBe('absence:test_creation@implementation');
+    expect(seen.dedupKey).toBe('absence:test_creation@implementation#2');
+    // And the list records the occurrence, which is what the gate checks.
+    expect(SessionStateManager.load(store, projectRoot).current.firedDecisionSessions)
+      .toEqual(['absence:test_creation@implementation#2']);
+  });
+
+  it('blocks the SAME occurrence and allows the next one', async () => {
+    const projectRoot = '/test/p2-occurrence';
+    setConfig(store, 'advisory_frequency', 'optimum');
+    primeStableAbsenceSession(projectRoot, 2);
+
+    const first = await fireOnce(projectRoot);
+    expect(first.alreadyFired).toBe(false);
+
+    // The popup behind it reached the user, so this occurrence is spent (phase 1 charges on show).
+    SessionStateManager.load(store, projectRoot).chargeShownPopupV1(store, 99, first.dedupKey);
+
+    const repeat = await fireOnce(projectRoot);
+    expect(repeat.dedupKey, 'the fixture stopped holding the occurrence still').toBe(first.dedupKey);
+    expect(repeat.alreadyFired, 'the same occurrence was allowed to fire twice').toBe(true);
+
+    // The detector re-raises the flag: same signal, same stage, NEW occurrence. Before this phase the
+    // key was identical, so it stayed blocked for the rest of the session.
+    const mgr = SessionStateManager.load(store, projectRoot);
+    const flags = (mgr as unknown as {
+      state: { absenceFlags: { signalKey: string; raisedAtIndex: number }[] };
+    }).state.absenceFlags;
+    for (const f of flags) if (f.signalKey === 'test_creation') f.raisedAtIndex = 40;
+    mgr.setDetectedLanguage(store, undefined);
+
+    const reRaised = await fireOnce(projectRoot);
+    expect(reRaised.firedKey, 'the signal itself must not change').toBe(first.firedKey);
+    expect(reRaised.dedupKey).toBe('absence:test_creation@implementation#40');
+    expect(reRaised.alreadyFired, 'a re-raised flag is a fresh occurrence and must fire again').toBe(false);
+  });
+
+  it('the keys remembered for the shown-popup charge are the OCCURRENCE keys', async () => {
+    // The composition point with phase 1, and the one that is silent when it breaks. Under
+    // `countBudgetOnShow` the gate reads the list these keys are charged into, so if the unsuffixed
+    // keys were remembered instead, the occurrence key the gate checks would never be present — and
+    // absence dedup would stop blocking ANYTHING, which is far more than this phase intends. Nothing
+    // else pins it: the tests above charge by hand to hold the occurrence still.
+    const projectRoot = '/test/p2-charge-keys';
+    setConfig(store, 'advisory_frequency', 'optimum');
+    primeStableAbsenceSession(projectRoot, 2);
+    const request = makeBoundaryRequest(store, projectRoot);
+    const facadeResult = await preparePromptEnhancement(request);
+
+    const mgr = SessionStateManager.load(store, projectRoot);
+    (mgr as unknown as { state: { stageConfidence: number } }).state.stageConfidence = 0.05;
+    mgr.setDetectedLanguage(store, undefined);
+    await runAuto(
+      makeInput({ projectRoot, promptText: LOW_SIGNAL_PROMPT }),
+      store,
+      makeAlwaysFiringOpenAI(0.40),
+      { request, prepare: vi.fn().mockResolvedValue(asLlmWorded(facadeResult)) },
+    );
+
+    const pending = SessionStateManager.load(store, projectRoot).current.pendingPopupCharge;
+    expect(pending, 'no row was stored, so this proves nothing about the charge keys').toBeDefined();
+    for (const key of pending!.keys) {
+      expect(key, `"${key}" was remembered without its occurrence — the gate would never match it`)
+        .toMatch(/#\d+$/);
+    }
+    expect(pending!.keys).toContain('absence:test_creation@implementation#2');
+  });
+
+  it('switch OFF (every_event): the fired list blocks the same occurrence too', async () => {
+    // Phase 2 is not behind phase 1's switch — the key shape changes on every level. Only WHICH list
+    // is read differs, so the level that reads `firedDecisionSessions` must behave the same way.
+    const projectRoot = '/test/p2-switch-off';
+    primeStableAbsenceSession(projectRoot, 2);   // no advisory_frequency set → every_event
+
+    // `every_event` needs 0.49 for the fire recommendation to survive its own parser floor; its
+    // condition-3 gate is 0.50, so the EMA (0.7*0.05 + 0.3*0.49 = 0.18) still clears it.
+    const first = await fireOnce(projectRoot, 0.49);
+    expect(first.dedupKey).toBe('absence:test_creation@implementation#2');
+    expect(first.alreadyFired).toBe(false);
+
+    const repeat = await fireOnce(projectRoot, 0.49);
+    expect(repeat.alreadyFired, 'the fired list should have blocked the same occurrence').toBe(true);
+  });
+
+  it('the telemetry and outcome logs still report the unsuffixed key', async () => {
+    // §3.5 of the plan: every event keeps its name and its shape. Only the numbers move.
+    const projectRoot = '/test/p2-log-shape';
+    setConfig(store, 'advisory_frequency', 'optimum');
+    primeStableAbsenceSession(projectRoot, 2);
+    const first = await fireOnce(projectRoot);
+    SessionStateManager.load(store, projectRoot).chargeShownPopupV1(store, 99, first.dedupKey);
+
+    vi.mocked(writeTelemetry).mockClear();
+    const infoSpy = vi.spyOn(logger, 'info');
+    await fireOnce(projectRoot);
+    const blocked = infoSpy.mock.calls
+      .filter((c) => c[0] === 'pipeline_outcome')
+      .map((c) => c[1] as { reason?: string; firedKey?: string })
+      .find((d) => d.reason === 'already_fired');
+    infoSpy.mockRestore();
+
+    expect(blocked?.firedKey, 'the outcome log gained an occurrence suffix').toBe('absence:test_creation@implementation');
+    expect(writeTelemetry).toHaveBeenCalledWith(
+      expect.anything(),
+      'advisory_dedup_blocked',
+      { firedKey: 'absence:test_creation@implementation' },
+      expect.anything(),
+    );
+  });
+
+  it('a stage transition keeps whole-session dedup — no suffix on its key', async () => {
+    // Transitions have no flag lifecycle, and the classifier oscillates between stages, which is the
+    // noise dedup was added for. Deliberately excluded from the change.
+    const projectRoot = '/test/p2-transition';
+    setConfig(store, 'advisory_frequency', 'optimum');
+    for (let i = 0; i < 3; i++) await runAuto(makeInput({ projectRoot }), store);
+
+    const spy = vi.spyOn(logger, 'debug');
+    await runAuto(makeInput({ projectRoot }), store, makeMockOpenAI(FIRE_YES_RESPONSE, 'Hold up.'));
+    const seen = dedupCalls(spy).at(-1)!;
+    spy.mockRestore();
+
+    expect(seen.firedKey.startsWith('stage_transition:')).toBe(true);
+    expect(seen.dedupKey, 'a transition key must carry no occurrence suffix').toBe(seen.firedKey);
+  });
+});

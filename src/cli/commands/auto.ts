@@ -1526,14 +1526,26 @@ export async function runAuto(
   const preCheckFiredKey = triggerResult.kind === 'stage_transition'
     ? buildFiredKey('stage_transition', prevStage, mgr.current.currentStage)
     : buildFiredKey(`absence:${triggerResult.qualifyingFlags[0]!.signalKey}` as FlagType, prevStage, mgr.current.currentStage);
+  // Phase 2: dedup blocks the OCCURRENCE of a signal, not the signal itself. An absence flag carries
+  // the prompt index it was raised at, and the detector raises a fresh one once the practice is still
+  // missing after its cooldown — that re-raise IS the "this is happening again" event, so it needs no
+  // invented TTL. Suffixing the key with it means one popup per occurrence instead of one per session.
+  //
+  // ⚠️ The suffix lives ONLY in this key. `firedKey` below is read by the PE request, the router, the
+  // guidance facts, the fatigue keys and the popup body the user reads — it stays byte-identical.
+  // Stage transitions keep today's dedup on purpose: they have no flag lifecycle, and the classifier
+  // oscillates between stages, which is the noise dedup was added for in the first place.
+  const dedupKey = triggerResult.kind === 'absence'
+    ? `${preCheckFiredKey}#${triggerResult.qualifyingFlags[0]!.raisedAtIndex}`
+    : preCheckFiredKey;
   // Phase 1: under `countBudgetOnShow` the gate asks "was this advice SHOWN to the user?" instead of
   // "did an advisory fire?" — an advisory whose popup was discarded must not block its own signal for
   // the rest of the session. `firedDecisionSessions` keeps being written below either way, so the
   // `once_per_session` level and the telemetry counters are untouched.
   const alreadyFired = freqConfig.countBudgetOnShow
-    ? mgr.hasShownAdvisoryKeyV1(preCheckFiredKey)
-    : mgr.hasFiredDecisionSession(preCheckFiredKey);
-  logger.debug('dedup', { firedKey: preCheckFiredKey, alreadyFired });
+    ? mgr.hasShownAdvisoryKeyV1(dedupKey)
+    : mgr.hasFiredDecisionSession(dedupKey);
+  logger.debug('dedup', { firedKey: preCheckFiredKey, dedupKey, alreadyFired });
   if (alreadyFired) {
     // F4: this key already fired in the session
     await prepareSequenceShapedPeFallback('blocked_by_dedup');
@@ -1635,6 +1647,10 @@ export async function runAuto(
   // For an absence trigger, use the classifier's selected signal when it is one of the
   // qualifying flags; else fall back to the first qualifying flag (deterministic).
   let effectiveFlagType: FlagType;
+  // Phase 2: the occurrence the selected flag belongs to — undefined for a stage transition, which
+  // keeps today's whole-session dedup. Held alongside the flag type so the dedup form of `firedKey`
+  // can be built without re-deriving which flag the classifier picked.
+  let selectedRaisedAtIndex: number | undefined;
   if (triggerResult.kind === 'stage_transition') {
     effectiveFlagType = 'stage_transition';
   } else {
@@ -1643,8 +1659,16 @@ export async function runAuto(
       ? stageResult.selectedSignalKey
       : triggerResult.qualifyingFlags[0]!.signalKey;
     effectiveFlagType = `absence:${selectedKey}`;
+    selectedRaisedAtIndex = (triggerResult.qualifyingFlags.find((f) => f.signalKey === selectedKey)
+      ?? triggerResult.qualifyingFlags[0]!).raisedAtIndex;
   }
   const firedKey = buildFiredKey(effectiveFlagType, prevStage, mgr.current.currentStage);
+  // Phase 2: the dedup-list form of `firedKey`. `firedKey` itself stays byte-identical — it is read by
+  // the PE request, the router, the guidance facts and the popup body — so the suffix is added only
+  // here, for the list the gate above reads.
+  const firedDedupKey = selectedRaisedAtIndex === undefined
+    ? firedKey
+    : `${firedKey}#${selectedRaisedAtIndex}`;
   // ── 8.1. typed PE preparation seam ────────────────────────────────────
   // Build and consume the approved PE packet by default. An injected integration
   // remains available for boundary tests, while the default path now exercises
@@ -1768,19 +1792,26 @@ export async function runAuto(
       // E8 popup-action calls are measured at their own surface via the popup costObservabilitySink.
       emitPromptEnhancementCostObservabilityV1(preparation.result, 'prepare', logger);
       // Phase 1: remember what this row would cost if it is ever SHOWN. Both keys travel, because the
-      // dedup gate checks `preCheckFiredKey` (first qualifying flag) while the row carries `firedKey`
-      // (the flag Stage 2 selected) — charging only the second would leave the first uncharged for
-      // ever, and an uncharged key never blocks. Bound to THIS row's prompt index: a row that is
-      // replaced or dropped unseen must not leave its keys behind for the next popup to spend.
+      // dedup gate checks the first qualifying flag's key while the row carries the key of the flag
+      // Stage 2 selected — charging only the second would leave the first uncharged for ever, and an
+      // uncharged key never blocks. Bound to THIS row's prompt index: a row that is replaced or
+      // dropped unseen must not leave its keys behind for the next popup to spend.
+      //
+      // Phase 2: both travel in their DEDUP form. Under `countBudgetOnShow` this list is what the gate
+      // above reads, so charging the unsuffixed keys would mean the occurrence key it checks is never
+      // present — and absence dedup would stop blocking altogether, which is far more than this phase
+      // intends. `firedKey` on the stored row itself is untouched.
       if (freqConfig.countBudgetOnShow) {
-        mgr.markPendingPopupChargeV1(store, mgr.current.promptCount, [preCheckFiredKey, firedKey]);
+        mgr.markPendingPopupChargeV1(store, mgr.current.promptCount, [dedupKey, firedDedupKey]);
       }
     }
   }
 
   // keeps legacy Decision Session bookkeeping after preparation; PE preparation
   // remains capture/classification-only and cannot gain DS authority.
-  mgr.markDecisionSessionFired(store, firedKey);
+  // Phase 2: the list records the occurrence, matching what the gate above checks. It still grows once
+  // per fire, so `once_per_session` (which only reads its length) is unchanged.
+  mgr.markDecisionSessionFired(store, firedDedupKey);
 
   // ── 8.5. Read user profile (computed in processPrompt, null if < 5 prompts) ──
   const userProfile = mgr.current.profile ?? undefined;
