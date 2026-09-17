@@ -27,6 +27,7 @@ vi.mock('openai', () => ({
 }));
 import { getRecentPrompts, insertPrompt } from '../../store/prompts.js';
 import {
+  absenceOccurrenceIndexV1,
   buildFiredKey,
   buildPromptEnhancementCliSubmitConsumerDiagnosticV1,
   buildPromptEnhancementRequestForAuto,
@@ -4412,5 +4413,89 @@ describe('runAuto — occurrence dedup (Phase 2)', () => {
 
     expect(seen.firedKey.startsWith('stage_transition:')).toBe(true);
     expect(seen.dedupKey, 'a transition key must carry no occurrence suffix').toBe(seen.firedKey);
+  });
+});
+
+// ── absenceOccurrenceIndexV1 — which absence window a signal is in ───────────
+
+describe('absenceOccurrenceIndexV1', () => {
+  const COOLDOWN = 30;   // ABSENCE_COOLDOWN_PROMPTS, the width the detector writes
+  const raises = (signalKey: string, ...idxs: number[]) =>
+    idxs.map((i) => ({ signalKey, raisedAtIndex: i, cooldownUntil: i + COOLDOWN }));
+
+  it('a single raise names its own window, for the whole window', () => {
+    const flags = raises('x', 10);
+    expect(absenceOccurrenceIndexV1(flags, 'x', 10)).toBe(10);
+    expect(absenceOccurrenceIndexV1(flags, 'x', 39)).toBe(10);
+    expect(absenceOccurrenceIndexV1(flags, 'x', 40), 'the window ended at 40').toBeUndefined();
+  });
+
+  it('a raise after the window closes opens a new occurrence', () => {
+    const flags = raises('x', 10, 60);
+    expect(absenceOccurrenceIndexV1(flags, 'x', 30)).toBe(10);
+    expect(absenceOccurrenceIndexV1(flags, 'x', 60)).toBe(60);
+    expect(absenceOccurrenceIndexV1(flags, 'x', 89)).toBe(60);
+  });
+
+  it('⛔ consecutive re-raises inside one window stay ONE occurrence', () => {
+    // The real shape this helper exists for, from the phase-1 s24 run: `user_feedback_review` was
+    // raised at 167 and then on every prompt from 197 to 205. Keyed on the raise, dedup would read
+    // eight of those as brand-new occurrences and let the same advice through eight times.
+    const flags = raises('user_feedback_review', 167, 197, 198, 199, 200, 201, 202, 203, 204, 205);
+    const seen = new Set<number | undefined>();
+    for (let p = 167; p <= 226; p++) seen.add(absenceOccurrenceIndexV1(flags, 'user_feedback_review', p));
+    expect([...seen].sort((a, b) => Number(a) - Number(b)), 'ten raises are two windows, not ten')
+      .toEqual([167, 197]);
+  });
+
+  it('⛔ a raise that clears the open window starts a new one, even mid-run', () => {
+    // Also real, from the same run: `implementation_checkpoint` raised at 11, 61, 68, 70, 90, 99.
+    // 61 opens a window to 91, which swallows 68, 70 and 90; 99 falls past it and genuinely starts
+    // the next. Without the merge the answer at 99 is 70 — an absorbed raise whose own window happens
+    // to still be open — and the occurrence would then drift one prompt at a time.
+    const flags = raises('implementation_checkpoint', 11, 61, 68, 70, 90, 99);
+    expect(absenceOccurrenceIndexV1(flags, 'implementation_checkpoint', 65)).toBe(61);
+    expect(absenceOccurrenceIndexV1(flags, 'implementation_checkpoint', 90)).toBe(61);
+    expect(absenceOccurrenceIndexV1(flags, 'implementation_checkpoint', 99)).toBe(99);
+    expect(absenceOccurrenceIndexV1(flags, 'implementation_checkpoint', 128)).toBe(99);
+  });
+
+  it('falls back to the oldest still-open raise when no merged window covers the prompt', () => {
+    // Absorbed raises outlive the window that swallowed them, so between a window closing and the
+    // next one opening there is a gap the merge cannot name. The signal IS still flagged there, so it
+    // must still get an occurrence rather than none.
+    const flags = raises('implementation_checkpoint', 11, 61, 68, 70, 90, 99);
+    expect(absenceOccurrenceIndexV1(flags, 'implementation_checkpoint', 95)).toBe(68);
+  });
+
+  it('a raise later than the prompt does not count — it has not happened yet', () => {
+    expect(absenceOccurrenceIndexV1(raises('x', 50), 'x', 10)).toBeUndefined();
+    expect(absenceOccurrenceIndexV1(raises('x', 10, 50), 'x', 20)).toBe(10);
+  });
+
+  it('only the named signal is considered', () => {
+    const flags = [...raises('a', 5), ...raises('b', 40)];
+    expect(absenceOccurrenceIndexV1(flags, 'b', 45)).toBe(40);
+    expect(absenceOccurrenceIndexV1(flags, 'a', 45), "a's window closed at 35").toBeUndefined();
+    expect(absenceOccurrenceIndexV1(flags, 'never-raised', 45)).toBeUndefined();
+  });
+
+  it('out-of-order raises give the same answer as sorted input', () => {
+    // Flags are appended in raise order today, but nothing in the type says so — and the merge reads
+    // them in sequence, so unsorted input would let a later raise open the window that should have
+    // swallowed it. OVERLAPPING windows on purpose: with 10 and 35 thirty apart, order is the only
+    // thing that decides whether 35 is absorbed.
+    const clean = raises('x', 10, 35, 90);
+    const messy = [...raises('x', 35), ...raises('x', 90), ...raises('x', 10)];
+    for (const p of [10, 20, 34, 38, 39, 50, 64, 90, 110]) {
+      expect(absenceOccurrenceIndexV1(messy, 'x', p), `prompt ${p}`)
+        .toBe(absenceOccurrenceIndexV1(clean, 'x', p));
+    }
+    // …and the sorted answer is the one that treats 35 as part of the window 10 opened.
+    expect(absenceOccurrenceIndexV1(clean, 'x', 38)).toBe(10);
+  });
+
+  it('an empty flag list answers undefined rather than throwing', () => {
+    expect(absenceOccurrenceIndexV1([], 'x', 5)).toBeUndefined();
   });
 });

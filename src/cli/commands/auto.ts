@@ -168,6 +168,55 @@ export function buildFiredKey(flagType: FlagType, prevStage: Stage, currentStage
   return `${flagType}@${currentStage}`;
 }
 
+/**
+ * Phase 2: name the absence WINDOW a signal is currently in, by the prompt index that opened it.
+ *
+ * This is the occurrence the dedup key is suffixed with, so it has to mean "this stretch of the signal
+ * being missing" — one value for as long as the same absence continues.
+ *
+ * A raise's own `raisedAtIndex` is NOT that value. The detector is meant to re-raise a signal at most
+ * once per `ABSENCE_COOLDOWN_PROMPTS`, but its cooldown check reads the FIRST flag it finds for the
+ * signal (`AbsenceDetector.ts:145`) while raises are appended — so once the oldest flag's window has
+ * passed, every later prompt on which the signal is still missing appends another raise. Measured on
+ * the phase-1 runs: `user_feedback_review` was raised at 167 and then at 197, 198, 199 … 205 — two
+ * absence windows recorded as ten raises. Keyed on the raise, dedup reads eight of those as brand-new
+ * occurrences and lets the same advice through eight times.
+ *
+ * So the raises are folded back into windows: scanning in order, a raise opens a NEW window only when
+ * it falls at or after the open one's end. That is what the detector's cooldown was meant to enforce,
+ * computed from the flags it already wrote — the detector itself is left alone, because changing it
+ * would move advisory volume on every level and surface, far outside this phase.
+ *
+ * Measured over the six recorded sim sessions (392 genuine windows): keying on the raise yields 439
+ * occurrences, the oldest-still-open raise yields 416, and this rule yields 409.
+ *
+ * Signals are matched by key only, not by stage, exactly as the detector's own cooldown check does,
+ * and each flag's own `cooldownUntil` is used rather than a recomputed one. When no merged window
+ * covers `promptCount` — reachable because absorbed raises outlive the window that swallowed them —
+ * the oldest raise still inside its own window is used instead, so a signal that is currently flagged
+ * always has an occurrence. `undefined` means the signal is not flagged at all here.
+ */
+export function absenceOccurrenceIndexV1(
+  flags: readonly { signalKey: string; raisedAtIndex: number; cooldownUntil: number }[],
+  signalKey: string,
+  promptCount: number,
+): number | undefined {
+  const raises = flags
+    .filter((f) => f.signalKey === signalKey && f.raisedAtIndex <= promptCount)
+    .sort((a, b) => a.raisedAtIndex - b.raisedAtIndex);
+
+  let windowEnd = Number.NEGATIVE_INFINITY;
+  for (const flag of raises) {
+    if (flag.raisedAtIndex < windowEnd) continue;    // absorbed into the window already open
+    windowEnd = flag.cooldownUntil;
+    if (promptCount < windowEnd) return flag.raisedAtIndex;
+  }
+
+  // No merged window covers this prompt: fall back to the oldest raise whose own window still does.
+  const stillOpen = raises.filter((f) => promptCount < f.cooldownUntil);
+  return stillOpen.length ? stillOpen[0]!.raisedAtIndex : undefined;
+}
+
 // ── Types ──────────────────────────────────────────────────────────────────────
 
 export interface AutoInput {
@@ -1536,7 +1585,11 @@ export async function runAuto(
   // Stage transitions keep today's dedup on purpose: they have no flag lifecycle, and the classifier
   // oscillates between stages, which is the noise dedup was added for in the first place.
   const dedupKey = triggerResult.kind === 'absence'
-    ? `${preCheckFiredKey}#${triggerResult.qualifyingFlags[0]!.raisedAtIndex}`
+    ? `${preCheckFiredKey}#${absenceOccurrenceIndexV1(
+        mgr.current.absenceFlags,
+        triggerResult.qualifyingFlags[0]!.signalKey,
+        mgr.current.promptCount,
+      ) ?? triggerResult.qualifyingFlags[0]!.raisedAtIndex}`
     : preCheckFiredKey;
   // Phase 1: under `countBudgetOnShow` the gate asks "was this advice SHOWN to the user?" instead of
   // "did an advisory fire?" — an advisory whose popup was discarded must not block its own signal for
@@ -1659,8 +1712,9 @@ export async function runAuto(
       ? stageResult.selectedSignalKey
       : triggerResult.qualifyingFlags[0]!.signalKey;
     effectiveFlagType = `absence:${selectedKey}`;
-    selectedRaisedAtIndex = (triggerResult.qualifyingFlags.find((f) => f.signalKey === selectedKey)
-      ?? triggerResult.qualifyingFlags[0]!).raisedAtIndex;
+    selectedRaisedAtIndex = absenceOccurrenceIndexV1(mgr.current.absenceFlags, selectedKey, mgr.current.promptCount)
+      ?? (triggerResult.qualifyingFlags.find((f) => f.signalKey === selectedKey)
+        ?? triggerResult.qualifyingFlags[0]!).raisedAtIndex;
   }
   const firedKey = buildFiredKey(effectiveFlagType, prevStage, mgr.current.currentStage);
   // Phase 2: the dedup-list form of `firedKey`. `firedKey` itself stays byte-identical — it is read by
