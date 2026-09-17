@@ -4357,6 +4357,96 @@ describe('runAuto — occurrence dedup (Phase 2)', () => {
     expect(pending!.keys).toContain('absence:test_creation@implementation#2');
   });
 
+  it('remembers BOTH occurrence keys when the classifier picks a different signal', async () => {
+    // The G1 ruling, now in occurrence form. The gate checks the first qualifying flag's key while the
+    // stored row carries the key of the flag Stage 2 selected, and those are different signals here.
+    // Charging only one leaves the other uncharged for ever, and an uncharged key never blocks — the
+    // fixtures above cannot see it, because there the two keys are the same string.
+    const projectRoot = '/test/p2-two-keys';
+    setConfig(store, 'advisory_frequency', 'optimum');
+    primeStableAbsenceSession(projectRoot, 2);
+    const request = makeBoundaryRequest(store, projectRoot);
+    const facadeResult = await preparePromptEnhancement(request);
+
+    const mgr = SessionStateManager.load(store, projectRoot);
+    (mgr as unknown as { state: { stageConfidence: number } }).state.stageConfidence = 0.05;
+    mgr.setDetectedLanguage(store, undefined);
+    // `test_creation` is first in the flag list, so it is what the gate checks; the classifier is told
+    // to select a different one, which is what the stored row will carry.
+    const client = {
+      chat: {
+        completions: {
+          create: vi.fn().mockResolvedValue({
+            choices: [{ message: { content: JSON.stringify({
+              ...absenceFireReply(0.40),
+              signals_absent: ['regression_check'],
+              selected_signal_key: 'regression_check',
+            }) } }],
+          }),
+        },
+      },
+    } as unknown as OpenAI;
+
+    await runAuto(
+      makeInput({ projectRoot, promptText: LOW_SIGNAL_PROMPT }),
+      store,
+      client,
+      { request, prepare: vi.fn().mockResolvedValue(asLlmWorded(facadeResult)) },
+    );
+
+    const pending = SessionStateManager.load(store, projectRoot).current.pendingPopupCharge;
+    expect(pending?.keys, 'the gate key and the row key are different signals and BOTH must be remembered')
+      .toEqual(expect.arrayContaining([
+        'absence:test_creation@implementation#2',
+        'absence:regression_check@implementation#2',
+      ]));
+  });
+
+  it('⛔ what auto remembers, charged the way stop charges it, blocks the gate', async () => {
+    // The seam nothing else joins. The tests above charge by hand with the key the gate reported, so
+    // they cannot notice if auto starts remembering one key while stop spends another — and stop pays
+    // with the row's own UNSUFFIXED `triggerProvenance.firedKey`, which under this phase no longer
+    // matches anything the gate asks for. The occurrence key survives only because it travels in the
+    // pending charge; if that ever stopped, dedup would go silently dead for absence signals.
+    const projectRoot = '/test/p2-e2e-charge';
+    setConfig(store, 'advisory_frequency', 'optimum');
+    primeStableAbsenceSession(projectRoot, 2);
+    const request = makeBoundaryRequest(store, projectRoot);
+    const facadeResult = await preparePromptEnhancement(request);
+
+    const mgr = SessionStateManager.load(store, projectRoot);
+    (mgr as unknown as { state: { stageConfidence: number } }).state.stageConfidence = 0.05;
+    mgr.setDetectedLanguage(store, undefined);
+    const spy = vi.spyOn(logger, 'debug');
+    await runAuto(
+      makeInput({ projectRoot, promptText: LOW_SIGNAL_PROMPT }),
+      store,
+      makeAlwaysFiringOpenAI(0.40),
+      { request, prepare: vi.fn().mockResolvedValue(asLlmWorded(facadeResult)) },
+    );
+    const gateKey = dedupCalls(spy).at(-1)!.dedupKey;
+    spy.mockRestore();
+
+    const row = getPendingPromptEnhancement(store, projectRoot);
+    expect(row, 'no row was stored, so the charge path is not being exercised').not.toBeNull();
+
+    // Byte-for-byte what `stop.ts` does at both display points.
+    SessionStateManager.load(store, projectRoot).chargeShownPopupV1(
+      store,
+      row!.promptCount,
+      row!.request.reviewMomentContext.triggerProvenance.firedKey,
+    );
+
+    const after = SessionStateManager.load(store, projectRoot);
+    expect(
+      after.hasShownAdvisoryKeyV1(gateKey),
+      'the popup was shown but the key the gate checks was never charged — dedup is dead for this signal',
+    ).toBe(true);
+
+    const repeat = await fireOnce(projectRoot);
+    expect(repeat.alreadyFired, 'a shown occurrence must not fire again').toBe(true);
+  });
+
   it('state written before this phase loads, and costs one extra fire per absence signal', async () => {
     // The upgrade path, and it is live: at the time of writing there are 81 unsuffixed keys sitting in
     // `session_states` on this machine. A session inside its 30-minute window when the new build lands
