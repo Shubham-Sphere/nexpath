@@ -107,8 +107,9 @@ export interface SessionState {
   /**
    * promptCount when a PE / MPS-1 popup was last SHOWN (Stop hook). Used by the popup-cooldown gate:
    * after a popup, new PE / MPS-1 popups are suppressed for `prompt_enhancement.popup_cooldown`
-   * prompts (default 7). -1 / absent = none shown yet (the first popup always shows). An active
-   * sequence's continuation items (MPS-2) are NOT gated by this — they are not new popups.
+   * prompts (CLI default 3; the browser keeps its own literal, 7). -1 / absent = none shown yet (the
+   * first popup always shows). An active sequence's continuation items (MPS-2) are NOT gated by this —
+   * they are not new popups.
    */
   lastPromptEnhancementPromptIndex?: number;
   /**

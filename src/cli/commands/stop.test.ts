@@ -147,7 +147,7 @@ describe('runStop — deferred Prompt Enhancement popup (B-i)', () => {
     expect(result).toEqual({ outcome: 'no_pending' });
   });
 
-  // Popup cooldown (prompt_enhancement.popup_cooldown, default 7): after a PE/MPS-1 popup is shown,
+  // Popup cooldown (prompt_enhancement.popup_cooldown, default 3): after a PE/MPS-1 popup is shown,
   // new ones are suppressed for N prompts. The first popup always shows.
   it('popup cooldown: the FIRST popup always shows (no prior popup this session)', async () => {
     await insertPendingPe(store); // lastPromptEnhancementPromptIndex defaults to -1 → not in cooldown
@@ -159,7 +159,7 @@ describe('runStop — deferred Prompt Enhancement popup (B-i)', () => {
 
   it('popup cooldown: a NEW popup within the cooldown is SUPPRESSED — never launched, record consumed', async () => {
     await insertPendingPe(store);
-    // A popup was just shown this prompt → cooldown active (default 7, promptCount unchanged).
+    // A popup was just shown this prompt → cooldown active (default 3, promptCount unchanged).
     SessionStateManager.load(store, '/test/project').markPromptEnhancementPopupShown(store);
     const launch = inject('SHOULD NOT SHOW');
     const result = await runStop(makePayload(), store, undefined, undefined, undefined, launch);
