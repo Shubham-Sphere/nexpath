@@ -4543,6 +4543,14 @@ describe('runAuto — occurrence dedup (Phase 2)', () => {
       + 'reading session state directly would name a different occurrence than the other at a window '
       + 'boundary, and the popup would be charged under one key and checked under the other',
     ).toBe(lookups - 1);
+    // …and the list itself must carry the raises that are not in session state yet. Emptying it back
+    // to `mgr.current.absenceFlags` leaves both call sites still reading "the prepared list" and every
+    // behavioural test green, because they drive the condition-3 path where the two are the same.
+    expect(
+      source.includes('[...mgr.current.absenceFlags, ...triggerResult.qualifyingFlags]'),
+      'the prepared list no longer carries the pending raises, so the gate is back to naming a '
+      + 'different occurrence than the fired key at a window boundary',
+    ).toBe(true);
   });
 
   it('a stage transition keeps whole-session dedup — no suffix on its key', async () => {
