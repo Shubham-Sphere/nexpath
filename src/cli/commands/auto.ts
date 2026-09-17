@@ -205,16 +205,27 @@ export function absenceOccurrenceIndexV1(
     .filter((f) => f.signalKey === signalKey && f.raisedAtIndex <= promptCount)
     .sort((a, b) => a.raisedAtIndex - b.raisedAtIndex);
 
+  let windowStart: number | undefined;
   let windowEnd = Number.NEGATIVE_INFINITY;
+  let absorbedButOpen: number | undefined;
   for (const flag of raises) {
-    if (flag.raisedAtIndex < windowEnd) continue;    // absorbed into the window already open
-    windowEnd = flag.cooldownUntil;
-    if (promptCount < windowEnd) return flag.raisedAtIndex;
+    if (flag.raisedAtIndex >= windowEnd) {           // opens a window of its own
+      windowStart = flag.raisedAtIndex;
+      windowEnd = flag.cooldownUntil;
+      if (promptCount < windowEnd) return windowStart;
+    } else if (absorbedButOpen === undefined && promptCount < flag.cooldownUntil) {
+      // Absorbed, but its own window outlives the one that swallowed it. Remember the window it
+      // BELONGS to, not the raise: the raise is a B-11 artifact, and naming it would hand back a
+      // different occurrence on each of the prompts where these tails expire one by one.
+      //
+      // The `undefined` guard takes the OLDEST such raise. With the detector's fixed 30-prompt width
+      // it can never matter — two still-open absorbed raises from different windows cannot coexist at
+      // a prompt no window covers — so no test can tell the two apart; it is kept because the type
+      // permits per-flag widths and the oldest is the answer that stays right if they ever vary.
+      absorbedButOpen = windowStart;
+    }
   }
-
-  // No merged window covers this prompt: fall back to the oldest raise whose own window still does.
-  const stillOpen = raises.filter((f) => promptCount < f.cooldownUntil);
-  return stillOpen.length ? stillOpen[0]!.raisedAtIndex : undefined;
+  return absorbedButOpen;
 }
 
 // ── Types ──────────────────────────────────────────────────────────────────────

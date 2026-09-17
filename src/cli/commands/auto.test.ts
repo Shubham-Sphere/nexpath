@@ -4357,6 +4357,38 @@ describe('runAuto — occurrence dedup (Phase 2)', () => {
     expect(pending!.keys).toContain('absence:test_creation@implementation#2');
   });
 
+  it('state written before this phase loads, and costs one extra fire per absence signal', async () => {
+    // The upgrade path, and it is live: at the time of writing there are 81 unsuffixed keys sitting in
+    // `session_states` on this machine. A session inside its 30-minute window when the new build lands
+    // keeps them, and the gate now builds a suffixed key that cannot match — so each absence signal
+    // gets exactly one more fire before the new key blocks it. Bounded and one-time, but it had to be
+    // checked rather than assumed, because "the list is full of keys that no longer match" is also
+    // what a broken key format looks like.
+    const projectRoot = '/test/p2-old-state';
+    setConfig(store, 'advisory_frequency', 'optimum');
+    primeStableAbsenceSession(projectRoot, 2);
+
+    // Exactly what an older build would have written: the key with no occurrence on it.
+    const before = SessionStateManager.load(store, projectRoot);
+    before.markDecisionSessionFired(store, 'absence:test_creation@implementation');
+    before.chargeShownPopupV1(store, 99, 'absence:test_creation@implementation');
+    expect(before.current.firedDecisionSessions).toEqual(['absence:test_creation@implementation']);
+
+    // One more fire gets through — the old key is not the key the gate now asks about.
+    const first = await fireOnce(projectRoot);
+    expect(first.alreadyFired, 'an unsuffixed key must not be read as the current occurrence').toBe(false);
+    expect(first.dedupKey).toBe('absence:test_creation@implementation#2');
+
+    // …and from then on the occurrence blocks normally. The old key is simply left behind.
+    SessionStateManager.load(store, projectRoot).chargeShownPopupV1(store, 99, first.dedupKey);
+    const repeat = await fireOnce(projectRoot);
+    expect(repeat.alreadyFired, 'the new key must block once it has been charged').toBe(true);
+    expect(
+      SessionStateManager.load(store, projectRoot).current.firedDecisionSessions,
+      'the pre-upgrade entry is kept, so once_per_session still counts it',
+    ).toContain('absence:test_creation@implementation');
+  });
+
   it('switch OFF (every_event): the fired list blocks the same occurrence too', async () => {
     // Phase 2 is not behind phase 1's switch — the key shape changes on every level. Only WHICH list
     // is read differs, so the level that reads `firedDecisionSessions` must behave the same way.
@@ -4466,8 +4498,14 @@ describe('absenceOccurrenceIndexV1', () => {
     // raised at 167 and then on every prompt from 197 to 205. Keyed on the raise, dedup would read
     // eight of those as brand-new occurrences and let the same advice through eight times.
     const flags = raises('user_feedback_review', 167, 197, 198, 199, 200, 201, 202, 203, 204, 205);
+    // Walked past the last window's end on purpose: the absorbed tails expire one prompt at a time,
+    // so naming the RAISE there would hand back a fresh occurrence on each of them — the failure this
+    // helper exists to prevent, arriving late instead of early.
     const seen = new Set<number | undefined>();
-    for (let p = 167; p <= 226; p++) seen.add(absenceOccurrenceIndexV1(flags, 'user_feedback_review', p));
+    for (let p = 167; p <= 400; p++) {
+      const occ = absenceOccurrenceIndexV1(flags, 'user_feedback_review', p);
+      if (occ !== undefined) seen.add(occ);
+    }
     expect([...seen].sort((a, b) => Number(a) - Number(b)), 'ten raises are two windows, not ten')
       .toEqual([167, 197]);
   });
@@ -4484,12 +4522,15 @@ describe('absenceOccurrenceIndexV1', () => {
     expect(absenceOccurrenceIndexV1(flags, 'implementation_checkpoint', 128)).toBe(99);
   });
 
-  it('falls back to the oldest still-open raise when no merged window covers the prompt', () => {
+  it('in the gap after a window closes, names the window the still-open raise belongs to', () => {
     // Absorbed raises outlive the window that swallowed them, so between a window closing and the
-    // next one opening there is a gap the merge cannot name. The signal IS still flagged there, so it
-    // must still get an occurrence rather than none.
+    // next one opening there is a stretch the merge cannot name. The signal IS still flagged there, so
+    // it must still get an occurrence — and it must be the window those raises belong to (61), not the
+    // raise itself (68), or the answer changes every time one of those tails expires.
     const flags = raises('implementation_checkpoint', 11, 61, 68, 70, 90, 99);
-    expect(absenceOccurrenceIndexV1(flags, 'implementation_checkpoint', 95)).toBe(68);
+    expect(absenceOccurrenceIndexV1(flags, 'implementation_checkpoint', 95)).toBe(61);
+    expect(absenceOccurrenceIndexV1(flags, 'implementation_checkpoint', 96)).toBe(61);
+    expect(absenceOccurrenceIndexV1(flags, 'implementation_checkpoint', 97)).toBe(61);
   });
 
   it('a raise later than the prompt does not count — it has not happened yet', () => {
@@ -4532,11 +4573,10 @@ describe('absenceOccurrenceIndexV1', () => {
     const persisted = [mk(0), mk(20)];   // 20 was absorbed by 0's window but its own runs to 50
     const pending = mk(30);              // raised this prompt, not yet in session state
 
-    expect(absenceOccurrenceIndexV1(persisted, 'x', 30), 'what the gate would see alone').toBe(20);
+    // Alone, the gate sees only 0's window — closed at 30 — and falls back to the window 20 belongs
+    // to, which is 0: an occurrence already charged. With the pending raise it sees 30 open a new one.
+    expect(absenceOccurrenceIndexV1(persisted, 'x', 30), 'what the gate would see alone').toBe(0);
     expect(absenceOccurrenceIndexV1([...persisted, pending], 'x', 30), 'what the fired key sees').toBe(30);
-    // …so the gate has to be handed the pending raise, which is what the call site does.
-    expect(absenceOccurrenceIndexV1([...persisted, pending], 'x', 30))
-      .toBe(absenceOccurrenceIndexV1([...persisted, pending], 'x', 30));
   });
 
   it('a duplicate raise changes nothing — the concatenated list may repeat a flag', () => {
