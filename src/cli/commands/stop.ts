@@ -55,6 +55,7 @@ import { buildFutureSequenceRuntimeGateEvidenceV1 } from '../../prompt-enhanceme
 import { evaluatePromptEnhancementFutureSequenceRuntimeGateV1 } from '../../prompt-enhancement/future-sequence-runtime-gate.js';
 import { PROMPT_ENHANCEMENT_CONTRACT_VERSION, type PromptEnhancementFutureSequenceRuntimeEventV1 } from '../../prompt-enhancement/contracts.js';
 import { resolveOpenAIKey, getKeySource } from '../../config/ApiKeyResolver.js';
+import { buildPromptEnhancementFrequencyControlV1 } from '../shared/pe-frequency-control.js';
 
 /**
  * nexpath stop — Claude Code Stop hook handler.
@@ -963,6 +964,9 @@ export function registerStopCommand(program: import('commander').Command): void 
               state: event.state,
               reasonCodes: event.reasonCodes.slice(0, 8),
             }),
+            // Ctrl+T inside the popup (owner request 2026-09-18) — the store lock is held here for
+            // the popup's whole life, so the chooser writes through this same connection.
+            frequencyControl: buildPromptEnhancementFrequencyControlV1(store, payload.cwd),
           });
         } else {
           // No direct TTY but a GUI session exists: spawn a terminal popup. Release the DB lock across

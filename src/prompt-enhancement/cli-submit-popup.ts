@@ -43,6 +43,12 @@ import {
   type PromptEnhancementMultilineEditorStateV1,
 } from './multiline-editor.js';
 import type { PromptActionSignalKind } from '../store/feedback-signals.js';
+import {
+  isPromptEnhancementFrequencyShortcutKeyV1,
+  promptEnhancementFrequencyHintV1,
+  runPromptEnhancementFrequencyChooserV1,
+  type PromptEnhancementFrequencyControlV1,
+} from './cli-frequency-shortcut.js';
 
 export type PromptEnhancementCliPopupCommandV1 =
   | { type: 'use_current' }
@@ -225,6 +231,13 @@ export async function runPromptEnhancementCliSubmitPopupV1(input: {
    */
   actionSignalSink?: (kind: PromptActionSignalKind, occurredAt: number) => void;
   onFirstRender?: () => void;
+  /**
+   * Ctrl+T — read/write the advisory frequency from inside the popup (owner request 2026-09-18,
+   * restoring the shortcut the disabled Decision Session popup used to carry). Supplied by the CLI
+   * hosts, which own the open store. Omitted, the shortcut is inert and unadvertised, so an
+   * injected `interaction` (the browser panel) is unaffected.
+   */
+  frequencyControl?: PromptEnhancementFrequencyControlV1;
 }): Promise<PromptEnhancementCliPopupResultV1> {
   let currentResult = input.result;
   let rendered = buildPromptEnhancementPopupRenderModelV1({
@@ -235,7 +248,7 @@ export async function runPromptEnhancementCliSubmitPopupV1(input: {
   if (rendered.state === 'no_popup') return { state: 'not_shown', reasonCodes: rendered.reasonCodes };
 
   const interaction = input.interaction === undefined
-    ? createPromptEnhancementCliPopupInteractionV1(input.onFirstRender)
+    ? createPromptEnhancementCliPopupInteractionV1(input.onFirstRender, input.frequencyControl)
     : input.interaction;
   if (!interaction) return { state: 'not_shown', reasonCodes: ['no_tty'] };
 
@@ -690,6 +703,12 @@ export interface PromptEnhancementCliFrameStateV1 {
   caret?: { field: PromptEnhancementEditorFieldV1; visualRow: number; visualColumn: number };
   /** Mutable sink the renderer fills with the caret's 1-based screen position (see `caret`). */
   caretOut?: { row: number; col: number };
+  /**
+   * Ctrl+T hint appended to the footer, e.g. `Ctrl+T frequency: High`. Set only by the raw-TTY
+   * shell, and only when it was given a frequency control — a surface that cannot act on Ctrl+T
+   * (the browser panel) must not advertise it. See `cli-frequency-shortcut.ts`.
+   */
+  frequencyHint?: string;
 }
 
 /** ANSI styles for the live popup's old-popup radio look (§8.1). */
@@ -841,7 +860,10 @@ export function renderPromptEnhancementPopupFrameV1(
     lines.push(publicText(view.publicNotice));
     lines.push('');
   }
-  lines.push(c ? `${c.dim}${PROMPT_ENHANCEMENT_CLI_FOOTER_V1}${c.reset}` : PROMPT_ENHANCEMENT_CLI_FOOTER_V1);
+  const footer = frameState.frequencyHint
+    ? `${PROMPT_ENHANCEMENT_CLI_FOOTER_V1} · ${publicText(frameState.frequencyHint)}`
+    : PROMPT_ENHANCEMENT_CLI_FOOTER_V1;
+  lines.push(c ? `${c.dim}${footer}${c.reset}` : footer);
 
   // Continuous cyan left rail (owner request): draw the rail on EVERY line so the left edge is one
   // unbroken vertical border, not the per-row segments it used to be. A blank line becomes the rail
@@ -1285,7 +1307,10 @@ export function openPromptEnhancementInteractiveConsoleV1(): { input: ReadStream
   }
 }
 
-function createPromptEnhancementCliPopupInteractionV1(onFirstRender?: () => void): PromptEnhancementCliPopupInteractionV1 | null {
+function createPromptEnhancementCliPopupInteractionV1(
+  onFirstRender?: () => void,
+  frequencyControl?: PromptEnhancementFrequencyControlV1,
+): PromptEnhancementCliPopupInteractionV1 | null {
   const consoleStreams = openPromptEnhancementInteractiveConsoleV1();
   if (!consoleStreams) return null;
   const { input, output, owned } = consoleStreams;
@@ -1331,6 +1356,16 @@ function createPromptEnhancementCliPopupInteractionV1(onFirstRender?: () => void
   // Kept bounded so the frame always fits and redraws in place (no repeat).
   const fieldWidth = () => promptEnhancementCliViewportV1(output.columns ?? 80, output.rows ?? 24).fieldWidth;
   const viewportRows = () => promptEnhancementCliViewportV1(output.columns ?? 80, output.rows ?? 24).viewportRows;
+  // Ctrl+T footer hint — shown only when a control was supplied, and never allowed to break the
+  // paint: a store read that throws simply drops the hint for that frame.
+  const frequencyHint = (): string | undefined => {
+    if (!frequencyControl) return undefined;
+    try {
+      return promptEnhancementFrequencyHintV1(frequencyControl.read());
+    } catch {
+      return promptEnhancementFrequencyHintV1(undefined);
+    }
+  };
 
   // Persistent listeners with a key buffer so no keystroke is dropped between reads.
   const keyBuffer: string[] = [];
@@ -1425,7 +1460,17 @@ function createPromptEnhancementCliPopupInteractionV1(onFirstRender?: () => void
     const caretOut = { row: -1, col: -1 };
     const frame = renderPromptEnhancementPopupFrameV1(
       { model: view.model, editedBodyText: bodyDisplay, additionalDetailsText: detailsDisplay, publicNotice: view.publicNotice },
-      { focusIndex: current.focusIndex, helpExpanded: current.helpExpanded, refinement: view.refinement, colorize: true, caret, caretOut },
+      {
+        focusIndex: current.focusIndex,
+        helpExpanded: current.helpExpanded,
+        refinement: view.refinement,
+        colorize: true,
+        caret,
+        caretOut,
+        // Read on every paint, so the level saved in the Ctrl+T chooser is visible the moment the
+        // popup comes back — that repaint IS the chooser's confirmation.
+        frequencyHint: frequencyHint(),
+      },
     );
     paint(frame);
 
@@ -1480,6 +1525,31 @@ function createPromptEnhancementCliPopupInteractionV1(onFirstRender?: () => void
     }
   };
 
+  // Ctrl+T (owner request 2026-09-18): the frequency chooser, run over this same console. It paints
+  // OVER the popup and restores it on return — the popup's own state (including an edited body) is
+  // never rebuilt, so checking a setting mid-edit costs nothing. `repaint` is re-pointed for the
+  // duration so a terminal resize repaints the chooser, not the popup underneath it (GAP-2).
+  const runFrequencyChooser = async (): Promise<void> => {
+    if (!frequencyControl) return;
+    let lastFrame = '';
+    const paintChooser = (frame: string): void => { lastFrame = frame; paint(frame); };
+    repaint = () => paint(lastFrame);
+    try {
+      output.write(HIDE_CURSOR);
+      await runPromptEnhancementFrequencyChooserV1({
+        control: frequencyControl,
+        readKey,
+        paint: paintChooser,
+        colorize: true,
+      });
+    } catch {
+      // A closed popup rejects the parked read; the outer loop handles that. The chooser must never
+      // take the popup down with it.
+    } finally {
+      repaint = paintMain;
+    }
+  };
+
   return {
     async next(view) {
       if (queue.length > 0) return queue.shift()!;
@@ -1506,6 +1576,13 @@ function createPromptEnhancementCliPopupInteractionV1(onFirstRender?: () => void
       for (;;) {
         const raw = await readKey();
         if (raw === CTRL_C) return { type: 'close' };
+        // Handled here, beside Ctrl+C, rather than in the shared reducer: the reducer also drives the
+        // browser panel, which has no store and no chooser. Ctrl+T is a terminal-shell affordance.
+        if (frequencyControl && isPromptEnhancementFrequencyShortcutKeyV1(raw)) {
+          await runFrequencyChooser();
+          render(view, state);
+          continue;
+        }
         const stepped = reducePromptEnhancementCliInteractionV1(state, rows, decodePromptEnhancementCliKeyV1(raw));
         state = stepped.state;
         if (stepped.commands.length > 0) {
