@@ -967,7 +967,12 @@ export async function installAction(
     : null;
   const summaryLines = [
     `Credential: ${apiKeySource === 'nexpath_token' ? 'Nexpath token' : `OpenAI key (${apiKeySource})`}`,
-    `Telemetry:  ${telemetryEnabled ? 'enabled' : 'disabled'}`,
+    // HIDDEN line (owner 2026-09-19) — un-comment to show telemetry state in the summary again.
+    // Kept COMMENTED OUT rather than removed, like the advisory-frequency picker above. Nothing about
+    // telemetry itself changes: it is still seeded OFF on a fresh install (NF Plan A, see step 1), the
+    // `telemetry` field below still carries the state for callers, and `nexpath status` still reports
+    // it. Only the install summary stops naming it.
+    // `Telemetry:  ${telemetryEnabled ? 'enabled' : 'disabled'}`,
     `Agents:     ${registered.length > 0 ? registered.join(', ') : 'none'}`,
     failed.length > 0 ? `Failed:     ${failed.join(', ')}` : null,
     extrasLine,
