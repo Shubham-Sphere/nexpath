@@ -4035,9 +4035,12 @@ describe('runAuto — budget counted on show (optimum level)', () => {
 
   it('20 fired-but-unseen advisories do not reach the cap', async () => {
     const { getSkippedSessions } = await import('../../store/skipped-sessions.js');
+    const { OPTIMUM_LEVEL_CONFIG: OPT } = await import('../../config/GlobalConfig.js');
     await runToDedupGate('/test/show-cap-unseen', (mgr) => {
       pinNonVibeProfile(mgr);
-      (mgr as unknown as { state: { advisoryCount: number } }).state.advisoryCount = 25;
+      // Well past the ceiling, so the only reason this does not cap is that fired-but-unseen
+      // advisories are not what the cap counts.
+      (mgr as unknown as { state: { advisoryCount: number } }).state.advisoryCount = OPT.sessionAdvisoryCapDefault + 5;
     });
     expect(getSkippedSessions(store, '/test/show-cap-unseen').some((s) => s.flagType === 'session_cap_reached')).toBe(false);
   });
@@ -4051,11 +4054,16 @@ describe('runAuto — budget counted on show (optimum level)', () => {
     expect(getSkippedSessions(store, '/test/show-cap-control').some((s) => s.flagType === 'session_cap_reached')).toBe(true);
   });
 
-  it('20 popups the user SAW do reach the cap', async () => {
+  it('popups the user SAW do reach the cap, counted from the ceiling the level declares', async () => {
+    // Reads the ceiling from the config rather than naming it. Phase 3 lifted this level's cap to
+    // 9999, and a literal here would have pinned the phase-1 behaviour to a number phase 3 owns — the
+    // point of the test is WHICH counter the cap reads, not what it is set to.
     const { getSkippedSessions } = await import('../../store/skipped-sessions.js');
+    const { OPTIMUM_LEVEL_CONFIG } = await import('../../config/GlobalConfig.js');
     await runToDedupGate('/test/show-cap-seen', (mgr) => {
       pinNonVibeProfile(mgr);
-      (mgr as unknown as { state: { shownPopupCount: number } }).state.shownPopupCount = 20;
+      (mgr as unknown as { state: { shownPopupCount: number } }).state.shownPopupCount =
+        OPTIMUM_LEVEL_CONFIG.sessionAdvisoryCapDefault;
     });
     expect(getSkippedSessions(store, '/test/show-cap-seen').some((s) => s.flagType === 'session_cap_reached')).toBe(true);
   });
