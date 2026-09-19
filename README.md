@@ -125,20 +125,35 @@ Nexpath CLI is built for prompt capture across AI coding agents.
 
 ## Add Nexpath to Your Development Workflow — Installation
 
-```bash
-# Clone and build from source
-git clone https://github.com/hi0001234d/nexpath.git
-cd nexpath
-npm install
-npm run build
-npm link
+The npm package is **`nexpath-cli`**; the commands it installs are `nexpath` and
+`nexpath-serve`.
 
-# Register with your coding agent and verify
+```bash
+# Install from npm (recommended)
+npm install -g nexpath-cli
+
+# Register with your coding agent
 nexpath install
 
 # Verify
 nexpath --version
 ```
+
+<details>
+<summary>Or build from source</summary>
+
+```bash
+git clone https://github.com/hi0001234d/nexpath.git
+cd nexpath
+npm install
+npm run build
+npm link      # links the nexpath-cli package, exposing the same nexpath binary
+
+nexpath install
+nexpath --version
+```
+
+</details>
 
 Setup notes:
 - **Install asks how Nexpath should run — one credential, two ways to give it:** your own
@@ -151,13 +166,13 @@ Setup notes:
 ### Uninstalling
 
 ```bash
-# Remove the Nexpath CLI
+# Remove the Nexpath CLI (package name: nexpath-cli, binary: nexpath)
 nexpath uninstall
-npm uninstall -g nexpath
-npm unlink -g nexpath
+npm uninstall -g nexpath-cli
+npm unlink -g nexpath-cli    # only if you installed via npm link
 
 # Verify it's gone
-npm list -g nexpath
+npm list -g nexpath-cli
 which nexpath
 
 # Clear local data and caches

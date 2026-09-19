@@ -1,5 +1,5 @@
 {
-  "name": "nexpath",
+  "name": "nexpath-cli",
   "version": "0.1.5",
   "description": "Behaviour guidance system for vibe coders using AI coding agents",
   "type": "module",
