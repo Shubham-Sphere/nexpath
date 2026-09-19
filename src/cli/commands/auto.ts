@@ -1194,7 +1194,7 @@ export async function runAuto(
   const freq = (
     getConfig(store.db, `advisory_frequency:${input.projectRoot}`) ??
     getConfig(store.db, 'advisory_frequency') ??
-    'every_event'
+    'optimum'
   ) as AdvisoryFrequencyLevel;
   const freqConfig = resolveFrequencyConfig(freq);
 

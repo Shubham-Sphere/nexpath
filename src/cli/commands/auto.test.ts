@@ -923,7 +923,12 @@ describe('readStdin', () => {
 describe('runAuto — MIN_PROMPTS_BEFORE_ADVISORY guard', () => {
   let store: Store;
 
-  beforeEach(async () => { store = await openStore(':memory:'); });
+  beforeEach(async () => {
+    store = await openStore(':memory:');
+    // Pins the Medium (`every_event`) gate numbers this suite is about — min 3 prompts,
+    // cap 5/10. The unset default became High (`optimum`: min 1, cap 9999) on 2026-09-19.
+    setConfig(store, 'advisory_frequency', 'every_event');
+  });
   afterEach(() => { store.db.close(); });
 
   it('returns no_action for first 2 prompts even when Stage 2 mock would fire', async () => {
@@ -1193,7 +1198,12 @@ describe('runAuto — advisory_frequency gate', () => {
 describe('runAuto — session advisory cap', () => {
   let store: Store;
 
-  beforeEach(async () => { store = await openStore(':memory:'); });
+  beforeEach(async () => {
+    store = await openStore(':memory:');
+    // Pins the Medium (`every_event`) gate numbers this suite is about — min 3 prompts,
+    // cap 5/10. The unset default became High (`optimum`: min 1, cap 9999) on 2026-09-19.
+    setConfig(store, 'advisory_frequency', 'every_event');
+  });
   afterEach(() => { store.db.close(); });
 
   it('advisoryCount initialises to 0 in new session', async () => {
@@ -1746,6 +1756,7 @@ describe('runAuto — telemetry events', () => {
 
   beforeEach(async () => {
     store = await openStore(':memory:');
+    setConfig(store, 'advisory_frequency', 'every_event');   // these assertions pin the Medium gate numbers
     vi.mocked(writeTelemetry).mockClear();
   });
 
@@ -2357,7 +2368,9 @@ describe('validated PE preparation boundary', () => {
       },
       {
         name: 'minimum-prompt',
-        configure: () => undefined,
+        // The min-prompts floor is 3 on Medium and 1 on High, and High is the unset default
+        // since 2026-09-19 — so the case names the level whose floor it exercises.
+        configure: (store) => { setConfig(store, 'advisory_frequency', 'every_event'); return undefined; },
         promptText: 'ok',
       },
       {
@@ -2372,6 +2385,10 @@ describe('validated PE preparation boundary', () => {
       {
         name: 'dedup',
         configure: (store, projectRoot) => {
+          // The fired-KEY dedup list is only what the gate reads below High: `optimum` sets
+          // countBudgetOnShow, which makes the gate read shown-popup state instead. High is the
+          // unset default since 2026-09-19, so the branch under test has to be selected.
+          setConfig(store, 'advisory_frequency', 'every_event');
           SessionStateManager.load(store, projectRoot).markDecisionSessionFired(store, 'stage_transition:idea→implementation');
           return makeMockOpenAI(FIRE_YES_RESPONSE);
         },
@@ -4068,8 +4085,9 @@ describe('runAuto — budget counted on show (optimum level)', () => {
     expect(getSkippedSessions(store, '/test/show-cap-seen').some((s) => s.flagType === 'session_cap_reached')).toBe(true);
   });
 
-  it('switch OFF (every_event, the default level): the fired key still blocks', async () => {
+  it('switch OFF (every_event, the Medium level): the fired key still blocks', async () => {
     const projectRoot = '/test/show-switch-off';
+    setConfig(store, 'advisory_frequency', 'every_event');
     for (let i = 0; i < 3; i++) await runAuto(makeInput({ projectRoot }), store);
     const mgr = SessionStateManager.load(store, projectRoot);
     (mgr as unknown as { state: { stageConfidence: number } }).state.stageConfidence = 0.3;
@@ -4079,7 +4097,7 @@ describe('runAuto — budget counted on show (optimum level)', () => {
     });
     const debugSpy = vi.spyOn(logger, 'debug');
     await runAuto(makeInput({ projectRoot }), store, makeMockOpenAI(FIRE_YES_RESPONSE, 'Hold up.'));
-    // No advisory_frequency set → every_event → countBudgetOnShow false → the fired key blocks, as always.
+    // every_event → countBudgetOnShow false → the fired key blocks, as always.
     expect(dedupDecision(debugSpy)).toBe(true);
   });
 });
@@ -4491,7 +4509,8 @@ describe('runAuto — occurrence dedup (Phase 2)', () => {
     // Phase 2 is not behind phase 1's switch — the key shape changes on every level. Only WHICH list
     // is read differs, so the level that reads `firedDecisionSessions` must behave the same way.
     const projectRoot = '/test/p2-switch-off';
-    primeStableAbsenceSession(projectRoot, 2);   // no advisory_frequency set → every_event
+    setConfig(store, 'advisory_frequency', 'every_event');   // the level under test — the UNSET default is 'optimum' since 2026-09-19
+    primeStableAbsenceSession(projectRoot, 2);
 
     // `every_event` needs 0.49 for the fire recommendation to survive its own parser floor; its
     // condition-3 gate is 0.50, so the EMA (0.7*0.05 + 0.3*0.49 = 0.18) still clears it.

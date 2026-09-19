@@ -943,8 +943,8 @@ async function runPromptSubmitPipeline(
   // the browser's advisory-firing gating is the same logic as the CLI's, just fed
   // from browser.storage.local instead of the sql.js config table.
   // Per-project override wins over the global setting (CLI parity); both fall back
-  // to the same 'every_event' default when unset.
-  const freq = (projectFreqRaw ?? freqRaw ?? 'every_event') as AdvisoryFrequencyLevel;
+  // to the same 'optimum' default when unset.
+  const freq = (projectFreqRaw ?? freqRaw ?? 'optimum') as AdvisoryFrequencyLevel;
   const freqConfig = resolveFrequencyConfig(freq);
   // Exact-equality on purpose: a stray truthy value must not arm this.
   const forceAdvisory = forceAdvisoryRaw === 'enabled';
@@ -1668,7 +1668,7 @@ async function handleResponseStopPeFirst(projectRoot: string, tabId: number | un
     keyStore.getKey(projectFreqKeyFor(projectRoot)),
     keyStore.getKey('advisory_frequency'),
   ]);
-  if ((projFreqRaw ?? globalFreqRaw ?? 'every_event') === 'off') {
+  if ((projFreqRaw ?? globalFreqRaw ?? 'optimum') === 'off') {
     await markPendingPeShown(projectRoot);
     log.debug('pe_suppressed_freq_off', { projectRoot });
     return;
@@ -1823,7 +1823,7 @@ async function handleResponseStopLegacyAdvisory(projectRoot: string, tabId: numb
     keyStore.getKey(projectFreqKeyFor(projectRoot)),
     keyStore.getKey('advisory_frequency'),
   ]);
-  if ((projFreqRaw ?? globalFreqRaw ?? 'every_event') === 'off') {
+  if ((projFreqRaw ?? globalFreqRaw ?? 'optimum') === 'off') {
     log.debug('pending_advisory_freq_off', { projectRoot });
     return;
   }
