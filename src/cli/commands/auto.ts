@@ -27,7 +27,7 @@ import { resolveLanguage } from '../../classifier/LanguageDetector.js';
 import { insertPrompt } from '../../store/prompts.js';
 import { redactSecrets } from '../../store/redact.js';
 import { getConfig } from '../../store/config.js';
-import { buildPromptEnhancementFrequencyControlV1 } from '../shared/pe-frequency-control.js';
+import { buildPromptEnhancementSettingsControlV1 } from '../shared/pe-settings-control.js';
 import { getProject, upsertProject } from '../../store/projects.js';
 import { getRecentPrompts } from '../../store/prompts.js';
 import { importHistoricalPrompts } from '../../store/historical-import.js';
@@ -1032,7 +1032,7 @@ export function createPromptEnhancementCliHostConsumerV1(
         actionSignalSink: (kind, occurredAt) => recordActionSignal(dependencies.store, request.projectRoot, kind, occurredAt),
         costObservabilitySink: (result) => emitPromptEnhancementCostObservabilityV1(result, 'popup_action', logger),
         // Ctrl+T inside the popup (owner request 2026-09-18) — this branch holds the open store.
-        frequencyControl: buildPromptEnhancementFrequencyControlV1(dependencies.store, request.projectRoot),
+        settingsControl: buildPromptEnhancementSettingsControlV1(dependencies.store, request.projectRoot),
       });
     } else {
       hostAdapter = 'linux_terminal';

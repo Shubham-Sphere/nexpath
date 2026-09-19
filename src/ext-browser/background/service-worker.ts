@@ -755,9 +755,10 @@ async function decideHeldSubmit(
   browser.tabs.sendMessage(tabId, { type: 'nexpath:pe-preparing', projectRoot })
     .catch(() => { /* tab gone — the notice is advisory only */ });
 
-  const [llmCreds, sequenceEnabled] = await Promise.all([
+  const [llmCreds, sequenceEnabled, currentSettings] = await Promise.all([
     resolveLLMCredentials(keyStore),
     resolvePeSequenceEnabled(projectRoot),
+    readPanelSettings(),
   ]);
   // Publish key + base URL into the engine's polyfilled env (own key wins;
   // Nexpath-token mode routes through the configured service — llm-credentials.ts).
@@ -770,6 +771,7 @@ async function decideHeldSubmit(
     apiKey,
     record: pe,
     sequenceEnabled,
+    currentSettings,
     feedbackStore: keyStore,
     sendToTab: (m) => browser.tabs.sendMessage(tabId, m),
     onFirstRendered: async () => {
@@ -1683,9 +1685,10 @@ async function handleResponseStopPeFirst(projectRoot: string, tabId: number | un
     return;
   }
 
-  const [llmCreds, sequenceEnabled] = await Promise.all([
+  const [llmCreds, sequenceEnabled, currentSettings] = await Promise.all([
     resolveLLMCredentials(keyStore),
     resolvePeSequenceEnabled(projectRoot),
+    readPanelSettings(),
   ]);
   // Own key wins; token mode routes via the service (llm-credentials.ts).
   applyLLMCredentialEnv(llmCreds);
@@ -1696,6 +1699,7 @@ async function handleResponseStopPeFirst(projectRoot: string, tabId: number | un
     apiKey,
     record: pe,
     sequenceEnabled,
+    currentSettings,
     feedbackStore: keyStore, // PE-BR-11 closed: PEF events persist locally
     sendToTab: (m) => browser.tabs.sendMessage(tabId, m),
     onFirstRendered: async () => {
@@ -1928,6 +1932,30 @@ async function handleResponseStopLegacyAdvisory(projectRoot: string, tabId: numb
  */
 const PANEL_FREQUENCY_VALUES = new Set(['optimum', 'every_event', 'major_only']);
 const PANEL_ROLE_VALUES = new Set(['founder', 'vibe_coder', 'indie_hacker', 'pm']);
+
+/**
+ * What the panel's Alt+Shift+T chooser shows as current.
+ *
+ * The GLOBAL keys, deliberately — `handleAdvisoryFooterIntent` writes those and
+ * clears any per-project override (user decision 2026-07-10: in the browser the
+ * chooser and the settings page must be ONE setting), so reading the per-project
+ * slot here would show a value the chooser cannot write. Best-effort: a storage
+ * failure leaves the chooser unlabelled rather than failing the popup.
+ */
+async function readPanelSettings(): Promise<{ frequency?: string; role?: string }> {
+  try {
+    const [frequency, role] = await Promise.all([
+      keyStore.getKey('advisory_frequency'),
+      keyStore.getKey('role'),
+    ]);
+    return {
+      ...(frequency ? { frequency } : {}),
+      ...(role ? { role } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
 
 async function handleAdvisoryFooterIntent(
   intent: 'disable-project' | 'open-settings' | 'set-frequency' | 'set-role',
