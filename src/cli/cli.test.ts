@@ -12,8 +12,8 @@ async function run(...args: string[]) {
 }
 
 describe('nexpath CLI — metadata', () => {
-  it('version is 0.1.5', () => {
-    expect(createProgram().version()).toBe('0.1.5');
+  it('version is 0.1.55', () => {
+    expect(createProgram().version()).toBe('0.1.55');
   });
 
   it('name is nexpath', () => {
