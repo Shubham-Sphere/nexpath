@@ -55,13 +55,20 @@ jobs:
           # bina secret set hone par bhi `npm publish` ENEEDAUTH deta hai.
           registry-url: "https://registry.npmjs.org"
 
-      - name: Preflight — token present when publishing
+      # OIDC ("trusted publishing") needs npm >= 11.5.1; Node 22 ships npm 10.x.
+      # Harmless when a token is used instead — it is just a newer npm.
+      - name: Upgrade npm (trusted publishing needs npm >= 11.5.1)
+        run: npm install -g npm@latest
+
+      - name: Preflight — how this run will authenticate
         run: |
-          if [ "$SHOULD_PUBLISH" = "true" ] && [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "::error::publish requested but the NPM_TOKEN secret is empty — add it under Settings → Secrets and variables → Actions."
-            exit 1
+          if [ -n "$NODE_AUTH_TOKEN" ]; then
+            echo "::notice::NPM_TOKEN present — publishing with a token."
+          else
+            echo "::notice::No NPM_TOKEN — publishing via trusted publishing (OIDC). npmjs.com must list this repo + workflow as the package's trusted publisher, or the publish will fail with ENEEDAUTH."
           fi
           echo "publish=$SHOULD_PUBLISH"
+          npm --version
 
       - name: Install deps
         run: npm ci
