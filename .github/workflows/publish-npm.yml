@@ -72,6 +72,13 @@ jobs:
       - name: Unit + integration tests
         run: npm test
 
+      # Build BEFORE publish so dist/ exists when npm first reads package.json.
+      # Without it npm warns "No bin file found at dist/cli/index.js" (twice per
+      # bin) because `prepublishOnly` only builds AFTER that read — the tarball
+      # was always correct, the warning just looked like a packaging fault.
+      - name: Build (so npm sees dist/ when it reads the bin paths)
+        run: npm run build
+
       - name: Preflight — this version is not already on npm
         run: |
           NAME="$(node -p "require('./package.json').name")"
